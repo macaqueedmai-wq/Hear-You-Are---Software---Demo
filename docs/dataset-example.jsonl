@@ -1,0 +1,3 @@
+{"kind":"knowledge","title":"虛構格式示例：知識資料","content":"這是展示資料欄位的虛構文字，沒有專業或臨床知識聲明。正式內容需要另行取得授權及專業審核。","source":"Hear You Are 開發者自行建立的虛構格式示例","license":"MIT（僅本虛構格式示例）","deidentified":true,"consent_to_use":true}
+{"kind":"counselling_case","title":"虛構格式示例：個案資料","content":"虛構人物甲表示在公開發言前有些緊張。這段文字僅展示個案資料格式，不包含真實人物、治療紀錄、診斷或臨床結論。","source":"Hear You Are 開發者自行建立的虛構格式示例；不是真實輔導個案","license":"MIT（僅本虛構格式示例）","deidentified":true,"consent_to_use":true}
+{"kind":"guidance","title":"虛構格式示例：指引資料","content":"這是虛構指引格式示例：介面可請用戶先核實摘要。這不是心理健康介入指引，也不會自動參與模型或訓練。","source":"Hear You Are 開發者自行建立的虛構格式示例；不是專業指引","license":"MIT（僅本虛構格式示例）","deidentified":true,"consent_to_use":true}

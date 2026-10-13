@@ -1,0 +1,5 @@
+-r requirements.txt
+# Optional NVIDIA CUDA 12 runtime; auto mode otherwise uses the same model on CPU.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.27.0.42
+nvidia-cuda-nvrtc-cu12==12.9.86
