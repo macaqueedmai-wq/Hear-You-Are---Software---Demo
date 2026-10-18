@@ -952,7 +952,7 @@ class Engine:
             return "You mentioned feeling lonely or finding it hard to talk with people."
         if "presentation" in value and re.search(r"\b(finished|completed|sent)\b", value):
             if "draft" in value:
-                return "You mentioned finishing the presentation draft." if "sent" not in value else "You mentioned sending the presentation draft."
+                return "You mentioned sending the presentation draft." if re.search(r"\bsent\b", value) else "You mentioned finishing the presentation draft."
             return "You mentioned finishing the presentation."
         if "presentation" in value and re.search(r"\b(send|share)\b", value):
             return "You mentioned needing to send or share the presentation draft."

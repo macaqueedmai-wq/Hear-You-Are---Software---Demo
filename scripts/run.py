@@ -18,11 +18,11 @@ def main():
     parser.add_argument("--open", action="store_true")
     args = parser.parse_args()
     if not (ROOT / "web/dist/index.html").exists():
-        raise SystemExit("前端尚未建置，請先執行 python scripts/setup.py。")
+        raise SystemExit("The frontend is not built. Run python scripts/setup.py first.")
     try:
         import uvicorn
     except ImportError:
-        raise SystemExit("缺少後端套件，請先執行 python scripts/setup.py。")
+        raise SystemExit("Backend dependencies are missing. Run python scripts/setup.py first.")
     url = f"http://127.0.0.1:{args.port}"
     if args.open:
         def show_when_ready():
@@ -36,7 +36,7 @@ def main():
                 except OSError:
                     time.sleep(0.5)
         threading.Thread(target=show_when_ready, daemon=True).start()
-    print(f"Hear You Are：{url}（按 Ctrl+C 停止）")
+    print(f"Hear You Are: {url} (press Ctrl+C to stop)")
     uvicorn.run("backend.hya.app:app", host="127.0.0.1", port=args.port)
 
 

@@ -57,6 +57,18 @@ def test_conversation_that_helped_emotion_remains_visible_in_social_card(engine)
     assert "feeling better after talking with a friend" in cards["social"]["summary"]
 
 
+@pytest.mark.parametrize(("text", "expected_summary"), [
+    ("I finished the first draft of my presentation today.", "You mentioned finishing the presentation draft."),
+    ("I completed my presentation draft today.", "You mentioned finishing the presentation draft."),
+    ("I sent my presentation draft today.", "You mentioned sending the presentation draft."),
+])
+def test_local_daily_summary_distinguishes_finishing_and_sending_a_draft(engine, text, expected_summary):
+    _, memory = add(engine, text, reviewed=False)
+    card = next(card for card in engine.state()["cards"] if memory["id"] in card["memory_ids"])
+    assert card["summary"] == expected_summary
+    assert engine.get_source(memory["id"])["segments"][0]["text"] == text
+
+
 def test_partial_identity_confirmation_does_not_assign_other_speakers(engine):
     recording = engine.create_recording("two-speakers.wav", None, "two-speakers", _now().isoformat())
     engine.ingest_segments(recording["id"], [

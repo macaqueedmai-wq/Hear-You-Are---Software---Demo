@@ -289,7 +289,7 @@ function DailyCard({ card, generation, open, edit, busy }: { card: Card; generat
     <h3>{card.title}</h3><p className="card-summary">{content.summary}</p>
     <div className="card-tags"><span className="tag">{content.tag}</span></div>
     <div className="review-actions"><button className="small-button" disabled={busy} onClick={open}>Sources</button><button className="small-button ghost" disabled={busy} onClick={edit}>Edit topic</button></div>
-    <div className="card-footer"><span><AudioLines size={14} />{card.memory_ids?.length || 0} atomic memories</span></div>
+    <div className="card-footer"><span><AudioLines size={14} />{card.memory_ids?.length || 0} atomic {card.memory_ids?.length === 1 ? "memory" : "memories"}</span></div>
   </article>;
 }
 
@@ -788,7 +788,7 @@ export default function App() {
       setNotice(
         result.duplicate
           ? "This recording was already imported; the existing source was kept and no duplicate evidence was added."
-          : "Recording uploaded. Transcribing → Atomic memories → Topics runs automatically; choose your own speaker segments separately.",
+          : "Recording uploaded. Transcription, atomic memories and topic organization run automatically. Confirm which source segments are yours when they are ready.",
       );
     } catch (err) {
       setError(errorText(err));
@@ -1065,10 +1065,10 @@ export default function App() {
                 {view === "daily"
                   ? "Look back on moods, connections and moments worth remembering. You can confirm or correct them."
                   : view === "import"
-                    ? "Upload an existing recording, complete English transcription, then confirm which segments are yours."
+                    ? "Upload an English recording. Transcription, atomic memories and topics are prepared automatically; then confirm which source segments are yours."
                     : view === "memory"
                       ? "See the original words and versions behind each memory, and bring it closer to what really happened."
-                      : "Reminders, suggestions or comfort appear only when their conditions are met."}
+                      : "Reminders, suggestions, comfort and warnings appear when their source conditions, your preferences and display settings allow."}
               </p>
             </div>
             <div className="heading-actions">
@@ -1186,11 +1186,11 @@ export default function App() {
                       <div className="banner-status">
                         <span>
                           <AudioLines size={14} />
-                          {recordings.length} recordings
+                          {recordings.length} recording{recordings.length === 1 ? "" : "s"}
                         </span>
                         <span>
                           <CheckCircle2 size={14} />
-                          {activeMemories.length} active memories
+                          {activeMemories.length} active {activeMemories.length === 1 ? "memory" : "memories"}
                         </span>
                       </div>
                     </div>
@@ -1613,7 +1613,7 @@ export default function App() {
                     <div>
                       <h2>Support with evidence, at your pace.</h2>
                       <p>
-                        Support updates automatically from your memories, confirmed speaker identity, preferences and conditions. When conditions are unclear, stay quiet.
+                        Support updates automatically from your confirmed memories, preferences and display settings. When the evidence is unclear, support stays quiet.
                       </p>
                     </div>
                     <button
@@ -1764,7 +1764,7 @@ export default function App() {
                   method: "PATCH",
                   body: JSON.stringify(patch),
                 }),
-              "Preferences updated; pending suggestions were re-checked.",
+              "Preferences updated; pending support was re-checked.",
             )
           }
         />
@@ -2126,7 +2126,7 @@ function Preferences({
           </div>
         )}
         <p className="modal-description">
-          Choose the support you would like to receive. Changes apply to pending suggestions.
+          Choose the support you would like to receive. Changes apply to pending support.
         </p>
         <div className="preference-list">
           {(["reminder", "suggestion", "comfort", "warning"] as CareType[]).map(
@@ -2161,7 +2161,7 @@ function Preferences({
         <label className="preference-row">
           <span>
             <strong>Quiet mode</strong>
-            <small>Stay quiet and pause all proactive suggestions</small>
+            <small>Pause automatic proactive support</small>
           </span>
           <input
             type="checkbox"
@@ -2173,7 +2173,7 @@ function Preferences({
         </label>
         <div className="preferences-fields">
           <label>
-            Minimum interval between suggestions (minutes)
+            Minimum interval between automatic support cards (minutes)
             <input
               type="number"
               min="0"
