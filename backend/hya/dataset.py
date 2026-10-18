@@ -23,7 +23,7 @@ import uuid
 MAX_BYTES = 5 * 1024 * 1024
 MAX_ITEMS = 1000
 KINDS = frozenset({"knowledge", "counselling_case", "guidance"})
-PURPOSE = "供後期專業審核及後訓練規劃的本機資料入口；目前不參與模型、主動關懷或訓練。"
+PURPOSE = "Local intake for later professional review and post-training planning; it plays no part in models, proactive care or training today."
 HK = timezone(timedelta(hours=8))
 
 

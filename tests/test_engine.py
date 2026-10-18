@@ -41,7 +41,7 @@ def test_raw_source_and_unknown_speaker_require_explicit_confirmation(engine):
     engine.confirm_recording(recording["id"], [source["segments"][0]["id"]])
     current = engine.get_source(memory["id"])["memory"]
     assert current["version"] == 2 and current["confirmed"]
-    assert current["reviewed"] is False and engine.evaluate()["cards"] == []
+    assert current["reviewed"] is False and engine.evaluate()["cards"][0]["type"] == "comfort"
     card = engine.state()["cards"][0]
     engine.confirm_card(card["id"], card["versions"], card["review_token"])
     assert engine.evaluate()["cards"][0]["type"] == "comfort"
@@ -54,7 +54,7 @@ def test_conversation_that_helped_emotion_remains_visible_in_social_card(engine)
     cards = {card["category"]: card for card in engine.state()["cards"]}
     assert set(cards) == {"mood", "social", "moments"}
     assert social["id"] in cards["social"]["memory_ids"]
-    assert "朋友交談後，感覺好些" in cards["social"]["summary"]
+    assert "feeling better after talking with a friend" in cards["social"]["summary"]
 
 
 def test_partial_identity_confirmation_does_not_assign_other_speakers(engine):
@@ -68,7 +68,7 @@ def test_partial_identity_confirmation_does_not_assign_other_speakers(engine):
     memories = engine.state()["memories"]
     assert sum(m["subject_id"] == "user" for m in memories) == 1
     assert sum(m["status"] == "pending" for m in memories) == 1
-    assert engine.evaluate()["assessment"]["matched_types"] == []
+    assert engine.evaluate()["assessment"]["matched_types"] == ["suggestion"]
     card = engine.state()["cards"][0]
     engine.confirm_card(card["id"], card["versions"], card["review_token"])
     assert engine.evaluate()["assessment"]["matched_types"] == ["suggestion"]
@@ -106,7 +106,7 @@ def test_correction_versions_original_text_and_display_invalidation(engine):
     source = engine.get_source(memory["id"])
     assert source["segments"][0]["text"] == memory["content"]
     assert source["versions"][0]["status"] == "superseded"
-    assert "完成簡報" in engine.state()["cards"][0]["summary"]
+    assert "finishing the presentation" in engine.state()["cards"][0]["summary"]
     assert engine.state()["proactive"] == []
     assert engine.evaluate()["cards"] == []
     with pytest.raises(VersionConflict):
@@ -131,7 +131,7 @@ def test_delete_memory_scrubs_history_and_derived_output_without_deleting_record
         assert "reassurance" not in memory_payload and "support" not in memory_payload
         proactive = json.loads(db.execute("SELECT payload FROM proactive").fetchone()[0])
         assert proactive["summary"] == "" and proactive["source_refs"] == []
-        assert proactive["title"] == "已取消的提示"
+        assert proactive["title"] == "Cancelled suggestion"
 
 
 def test_delete_recording_cascades_and_removes_only_managed_audio(engine):
@@ -199,7 +199,7 @@ def test_multiple_types_are_not_resolved_by_invented_priority(engine):
     add(engine, "I need help preparing my presentation. Please comfort me.")
     evaluation = engine.evaluate()
     assert set(evaluation["assessment"]["matched_types"]) == {"suggestion", "comfort"}
-    assert "多類" in evaluation["assessment"]["reason"] and evaluation["cards"] == []
+    assert "Several types" in evaluation["assessment"]["reason"] and evaluation["cards"] == []
 
 
 def test_warning_requires_fictional_source_and_two_explicit_opt_ins(engine):
@@ -264,7 +264,7 @@ def test_frequency_limits_new_candidates_but_does_not_hide_same_displayed_card(e
     engine.feedback(card["id"], "dismiss")
     add(engine, "I need emotional support.")
     evaluation = engine.evaluate()
-    assert not evaluation["cards"] and "頻率" in evaluation["assessment"]["reason"]
+    assert not evaluation["cards"] and "minimum interval" in evaluation["assessment"]["reason"]
     engine.settings_patch({"frequency_minutes": 0})
     fresh = engine.evaluate()["cards"][0]
     assert fresh["id"] != card["id"]
@@ -357,7 +357,12 @@ def test_optional_proactive_model_can_only_change_wording(engine):
     assert engine.get_source(memory["id"])["memory"] == memory
 
 
-def test_proactive_model_response_rejected_after_preferences_evidence_or_type_conflict(engine):
+def test_proactive_model_response_rejected_after_preferences_evidence_or_type_conflict(engine, monkeypatch):
+    from hya import engine as engine_module
+
+    clock = [_now().replace(hour=10, minute=0, second=0, microsecond=0)]
+    monkeypatch.setattr(engine_module, "_now", lambda: clock[0])
+    monkeypatch.setitem(globals(), "_now", lambda: clock[0])
     _, memory = add(engine, "Please comfort me.")
     card = engine.evaluate()["cards"][0]
     with pytest.raises(VersionConflict):
@@ -366,6 +371,9 @@ def test_proactive_model_response_rejected_after_preferences_evidence_or_type_co
     with pytest.raises(VersionConflict):
         engine.apply_proactive_text(card["id"], "支持", "可以先停一停。", card["versions"])
     engine.settings_patch({"quiet_mode": False})
+    # Cancelling displayed content must retain its automatic delivery interval.
+    assert engine.evaluate()["cards"] == []
+    clock[0] += timedelta(minutes=61)
     fresh = engine.evaluate()["cards"][0]
     add(engine, "I need help preparing my presentation.")
     with pytest.raises(VersionConflict):
@@ -390,7 +398,7 @@ def test_ingest_validation_rolls_back_partial_transcript(engine):
     assert engine.get_recording(recording["id"])["segments"] == []
 
 
-def test_legacy_memory_without_review_flag_is_not_treated_as_semantically_verified(engine):
+def test_legacy_memory_without_review_flag_keeps_identity_based_support_without_marking_reviewed(engine):
     _, memory = add(engine, "Please comfort me.")
     assert engine.evaluate()["cards"]
     with sqlite3.connect(engine.db_path) as db:
@@ -399,8 +407,8 @@ def test_legacy_memory_without_review_flag_is_not_treated_as_semantically_verifi
         db.execute("UPDATE memories SET payload=? WHERE id=?", (json.dumps(payload), memory["id"]))
     restarted = Engine(engine.data_dir)
     assert restarted.state()["memories"][0]["reviewed"] is False
-    assert restarted.state()["proactive"] == []
-    assert restarted.evaluate()["cards"] == []
+    assert restarted.state()["proactive"]
+    assert restarted.evaluate()["cards"][0]["type"] == "comfort"
 
 
 def test_sleep_pattern_counts_distinct_verified_days_not_duplicate_uploads(engine):
@@ -411,7 +419,8 @@ def test_sleep_pattern_counts_distinct_verified_days_not_duplicate_uploads(engin
     assert engine.evaluate()["cards"] == []
     recording, memory = add(engine, "I did not get enough sleep last night.",
                             recorded_at=(now - timedelta(days=2)).isoformat(), sha="sleep--2", reviewed=False)
-    assert engine.evaluate()["cards"] == []
+    assert engine.evaluate()["cards"][0]["support_basis"] == "sleep_pattern"
+    assert engine.get_source(memory["id"])["memory"]["reviewed"] is False
     card = engine.state(memory["event_time"][:10])["cards"][0]
     engine.confirm_card(card["id"], card["versions"], card["review_token"])
     support = engine.evaluate()["cards"][0]
@@ -442,7 +451,7 @@ def test_emotional_history_support_keeps_every_period_and_invalidates_changed_hi
 ])
 def test_negated_statements_are_not_paraphrased_as_positive_events_or_feelings(engine, text):
     add(engine, text)
-    assert "沒有可由本機規則可靠歸納" in engine.state()["cards"][0]["summary"]
+    assert "could not reliably summarise" in engine.state()["cards"][0]["summary"]
     assert not engine._stress_signal(text) and not engine._lonely_signal(text)
     assert engine.evaluate()["cards"] == []
 
@@ -452,7 +461,7 @@ def test_sleep_pattern_needs_explicit_insufficiency_not_an_hour_threshold(engine
     for offset in (-2, -1, 0):
         add(engine, "I only slept 12 hours.", recorded_at=(now + timedelta(days=offset)).isoformat(), sha=f"hours-{offset}")
     assert engine.evaluate()["cards"] == []
-    assert "睡眠不足" not in engine.state()["cards"][0]["summary"]
+    assert "not getting enough sleep" not in engine.state()["cards"][0]["summary"]
     assert engine._sleep_signal("I did not get enough sleep last night.")
     assert engine._sleep_signal("I didn't get enough sleep last night.")
     assert not engine._sleep_signal("I am not sleep deprived.")
@@ -468,7 +477,7 @@ def test_negated_social_improvement_does_not_trigger_historical_encouragement(en
 def test_review_slides_and_meeting_reminder_are_summarized_without_task_authorization(engine):
     add(engine, "Tomorrow I need to review my slides at 9 in the morning. Please remind me to prepare before the meeting.")
     card = engine.state()["cards"][0]
-    assert "明天早上 9 時" in card["summary"] and "會議前準備" in card["summary"]
+    assert "review your slides at 9 tomorrow morning" in card["summary"] and "prepare before the meeting" in card["summary"]
     assert all(memory["follow_up"] is None for memory in engine.state()["memories"])
     assert engine.evaluate()["cards"] == []
 
@@ -476,6 +485,6 @@ def test_review_slides_and_meeting_reminder_are_summarized_without_task_authoriz
 def test_mixed_known_and_unknown_content_explicitly_reports_uncovered_memories(engine):
     add(engine, "I completed my presentation. I explored a new topic in the archive.")
     card = engine.state()["cards"][0]
-    assert "已完成簡報" in card["summary"]
-    assert "另外有 1 則記憶未能可靠歸納" in card["summary"]
+    assert "finishing the presentation" in card["summary"]
+    assert "Another 1 memory could not be reliably summarised" in card["summary"]
     assert len(card["memory_ids"]) == 2 and len(card["versions"]) == 2

@@ -1,0 +1,15 @@
+{
+  "version": "2.0",
+  "statement": [
+    {
+      "effect": "allow",
+      "action": [
+        "asr:CreateRecTask",
+        "asr:DescribeTaskStatus"
+      ],
+      "resource": [
+        "*"
+      ]
+    }
+  ]
+}

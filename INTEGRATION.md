@@ -1,4 +1,48 @@
-# MVP 整合契約（2026-10-13）
+# 目前整合契約（2026-10-18：自動流程與可編輯主題）
+
+本節優先於後方歷史快照。新版本程式與本機驗證已更新；是否完成最新雲端發布，須以當次部署記錄確認。
+
+- **Uploading date** 唯一來源是伺服器建立錄音時保存的 `created_at`，以香港 UTC+8 顯示。新錄音的相容日期欄位同步使用這個時間；既有資料由遷移處理。這是上傳時間，不代表實際事件發生時間。前端不傳 `recorded_at`、不提供日期編輯器。
+- 上傳自動執行 **Transcribing → Atomic memories → Topics**，並自動更新摘要及主動支持；正常流程不要求再按 Process、核准 AI 理解或 Check conditions。失敗可重試，模型失敗不能偽稱成功。
+- 說話者確認仍獨立：原始片段保持匿名／未知，只有明確提交 **Confirm N segments as mine** 才歸屬為本人。編輯主題／原子記憶不會代為確認身分或授予許可。
+- 主動支持不再以 `reviewed`／AI 理解核准為門檻；仍檢查有效來源、說話者歸屬、使用者偏好、跟進許可、各類條件、免打擾、頻率及版本。
+- **Atomic memories** 按主題 1、2、3… 展示；每個主題均有 **Edit topic**。原子記憶可顯示 1.1、1.2…，說話者未確認亦可編輯。每日卡片提供摘要、Sources 及 Edit topic，不提供 That's right／Needs changes 核准步驟。
+
+## 主動支持顯示時間與即時顯示
+
+四類支持各自提供 `assessment.types[type].display_time={scheduled_at,effective_at,displayed_at,reason}`，以香港 UTC+8 顯示預定、最早自動顯示及最近已顯示時間；無法確定的時間明確說明。這是單次最早顯示時間，不是背景系統通知或每日循環排程。
+
+`PATCH /api/proactive/display-time` JSON `{type,display_at:ISO|null,expected_display_at:原值|null}` 修改指定類型時間；null 回到自動安排。後端正規化時區並以舊值防止覆蓋其他編輯，衝突回 409，前端保留草稿。設為未來會延後已顯示支持；時間到後仍檢查來源、偏好、免打擾及 snooze。
+
+每類的 **Edit display time** 旁為 **Display Proactive Support Now**，取代 Comfort me now。`POST /api/proactive/display-now` JSON `{type,date?}` 回傳 `{cards,assessment,care_generation}`。手動顯示只跳過送達排程，不修改已存時間或全域偏好；仍需當前、身分已確認的有效來源與各類條件／許可，Warning 保留虛構示範開關。重複請求共用當前版本卡片與模型工作。舊 comfort-now API 保留相容，前端不再提供該按鈕。
+
+**Preferences & model → Warning** 控制真實錄音的關懷警示，僅更新 `preferences.warning`，不依賴舊的 `warning_demo_enabled`。觸發條件是今天明確表達強烈困擾，或最近七天（含今天）至少三個不同日期明確表達同一類情緒／社交困擾。只使用已確認屬於用戶、有效且有時間的原文引句或用戶修正；模型改寫不能創造觸發條件，重複記憶不會增加日期數。卡片提供 `support_basis=acute_distress|repeated_distress` 及 `warning_trigger={basis,topics,dates,day_count,window_days,evidence_quotes}`，保留來源鏈結、編輯撤回與版本重查。真實 Warning 在自動類別選擇時優先；排程、免打擾和頻率仍有效。DeepSeek 使用原文語言生成簡短支持，不作診斷或風險預測。預設仍關閉，不修改現有偏好；舊虛構範例保留雙權限與清楚標示。
+
+## 持久化主題與編輯 API
+
+每日摘要在片段確認歸屬後自動生成。`state.summary_generation` 為 `{status,message}`，狀態是 `no-sources|queued|running|failed|unconfigured|ready`。前端只在 queued／running 顯示生成中並加快輪詢；只有 failed 提供 Retry summary。正常流程沒有額外 Generate 點擊。`POST /api/analysis/generate` 沿用作明確重試，會加入同一版本來源的背景工作。事實修正／刪除／新增有效來源後，自動更新相關每日摘要；原始音訊、片段文字、說話者確認及許可不變。
+
+自動摘要與記憶 consolidation 是相鄰的不同步驟：後者會在暫定記憶階段提出重複／衝突建議並整理主題，使用者確認說話者後，摘要讀取有效記憶顯示卡片。Consolidation 的 LLM 建議仍是 advisory，不會自動合併或覆寫使用者事實。
+
+`recording.topics` 是權威主題清單，每項為 `{id,title,summary,source_segment_ids,version,edited,memory_ids,number}`。`number` 是按時間排序的 1 起算編號；來源 ID 必須完整、連續且依時間分割原始片段。主題不依賴暫時的 `memory_pipeline` 報告，確認身分、編輯或該報告變為 stale 時仍保留。使用者已修改的主題與原子事實不被重試模型覆蓋。
+
+`PATCH /api/recordings/{recording_id}/topics/{topic_id}`：
+
+```json
+{"version":3,"title":"Topic title","summary":"Topic summary","memories":[{"id":"memory-id","version":2,"content":"Edited atomic memory"}]}
+```
+
+`memories` 可省略；前端只提交修改過的同主題原子記憶。限制為標題 120、摘要 2000、每條原子記憶 4000 字元。成功直接回傳更新後 Recording，再刷新 state 取得原子內容／版本。任何主題或原子版本衝突回 409；前端保留輸入，使用者明確刷新保存值、比較後才可再次保存。原音、逐字稿時間／文字、說話者身分及許可不變。
+
+`recording.topic_pipeline` 單獨追蹤既有逐字稿整理的 pending／processing／completed／failed。後端可用 `POST /api/recordings/{id}/organize` 背景整理；正常上傳不需要前端額外點擊。`memory_pipeline` 的舊建議變 stale 不代表權威主題失效。
+
+語音預設為本機／主機 SenseVoiceSmall INT8＋VAD＋匿名說話者分群；逐字稿及記憶文字仍傳往設定的官方 DeepSeek 端點。金鑰只在後端。來源、記憶、刪除、偏好、提醒及資料集等非衝突 API 介面沿用；專業資料集入口仍不自動啟用後訓練。
+
+目前前端通過 production build 及 32 項 helper 測試，包含 Uploading date、持久化編號主題、未確認身分時的編輯、CAS 草稿保存，以及移除舊日期／理解核准入口。歷史 ASR 基準不能證明新流程已完成雲端驗收。
+
+## 歷史快照：2026-10-13 MVP（已被上方政策取代）
+
+下列原文保留追溯用途；其中手動錄音時間、Whisper 預設、理解核准／`reviewed` 門檻及 That's right 流程不是目前產品規則。
 
 ## v0.2 主動式 AI 補充（優先於下列舊契約）
 

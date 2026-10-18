@@ -1,0 +1,4 @@
+# CPU speech inference with recording-local speaker diarization. No Torch/CUDA.
+-r requirements.txt
+numpy>=2,<3
+sherpa-onnx==1.13.8

@@ -7,12 +7,12 @@ from test_api import api, completed, review_cards, upload
 HK = timezone(timedelta(hours=8))
 
 
-def test_identity_and_understanding_are_two_distinct_user_decisions(api):
+def test_confirmed_identity_can_trigger_support_without_mandatory_card_review(api):
     client, app, fake, directory = api
     rec = completed(client, upload(client)["recording"]["id"])
     assert client.post(f"/api/recordings/{rec['id']}/confirm", json={}).status_code == 200
     state = client.get("/api/state").json()
-    assert state["cards"] and state["proactive"] == []
+    assert state["cards"] and state["proactive"][0]["type"] == "comfort"
     assert all(m["confirmed"] and not m["reviewed"] for m in state["memories"])
     assert all(c["review_status"] == "pending" and c["review_prompt"] for c in state["cards"])
     reviewed = review_cards(client, state)

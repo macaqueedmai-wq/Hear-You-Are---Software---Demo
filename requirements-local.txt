@@ -1,0 +1,3 @@
+# Optional legacy local ASR only. The Tencent + DeepSeek path does not load it.
+-r requirements.txt
+faster-whisper>=1.2,<2

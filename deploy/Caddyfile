@@ -1,0 +1,10 @@
+{$HYA_DOMAIN} {
+	request_body {
+		max_size 110MB
+	}
+	basic_auth {
+		{$HYA_DEMO_USER} {$HYA_PASSWORD_HASH}
+	}
+	encode zstd gzip
+	reverse_proxy app:8765
+}

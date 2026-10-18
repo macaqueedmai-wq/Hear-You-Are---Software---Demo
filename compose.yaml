@@ -1,0 +1,79 @@
+name: hear-you-are
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      HYA_ALLOWED_HOSTS: "localhost,127.0.0.1,${HYA_DOMAIN:?Set HYA_DOMAIN in deploy/.env}"
+      HYA_DEPLOYMENT_MODE: server
+      HYA_DATA_DIR: /var/lib/hear-you-are
+      HYA_ASR_PROVIDER: sensevoice
+      HYA_SENSEVOICE_MODEL_PATH: "${HYA_SENSEVOICE_MODEL_PATH:-/var/cache/hear-you-are/sensevoice/model.int8.onnx}"
+      HYA_SENSEVOICE_TOKENS_PATH: "${HYA_SENSEVOICE_TOKENS_PATH:-/var/cache/hear-you-are/sensevoice/tokens.txt}"
+      HYA_SILERO_VAD_MODEL_PATH: "${HYA_SILERO_VAD_MODEL_PATH:-/var/cache/hear-you-are/sensevoice/silero_vad.onnx}"
+      HYA_SENSEVOICE_CHUNK_SECONDS: "${HYA_SENSEVOICE_CHUNK_SECONDS:-30}"
+      HYA_SENSEVOICE_NUM_THREADS: "${HYA_SENSEVOICE_NUM_THREADS:-4}"
+      HYA_DIARIZATION_SEGMENTATION_PATH: "${HYA_DIARIZATION_SEGMENTATION_PATH:-/var/cache/hear-you-are/diarization/segmentation.onnx}"
+      HYA_DIARIZATION_EMBEDDING_PATH: "${HYA_DIARIZATION_EMBEDDING_PATH:-/var/cache/hear-you-are/diarization/embedding.onnx}"
+      HYA_DIARIZATION_THRESHOLD: "${HYA_DIARIZATION_THRESHOLD:-0.5}"
+      HYA_DIARIZATION_NUM_THREADS: "${HYA_DIARIZATION_NUM_THREADS:-2}"
+      HYA_MAX_UPLOAD_MB: "100"
+      HYA_MAX_AUDIO_MINUTES: "20"
+      HYA_MEMORY_MODE: deepseek
+      HYA_DEEPSEEK_BASE_URL: "${HYA_DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+      HYA_DEEPSEEK_MODEL: "${HYA_DEEPSEEK_MODEL:-deepseek-flash}"
+      HYA_DEEPSEEK_RAW_EVIDENCE_API_KEY: "${HYA_DEEPSEEK_RAW_EVIDENCE_API_KEY:-}"
+      HYA_DEEPSEEK_ATOMIC_API_KEY: "${HYA_DEEPSEEK_ATOMIC_API_KEY:-}"
+      HYA_DEEPSEEK_CONSOLIDATION_API_KEY: "${HYA_DEEPSEEK_CONSOLIDATION_API_KEY:-}"
+      HYA_DEEPSEEK_RETRIEVAL_API_KEY: "${HYA_DEEPSEEK_RETRIEVAL_API_KEY:-}"
+      HYA_DEEPSEEK_GOVERNANCE_API_KEY: "${HYA_DEEPSEEK_GOVERNANCE_API_KEY:-}"
+      HYA_DEEPSEEK_RAW_EVIDENCE_MODEL: "${HYA_DEEPSEEK_RAW_EVIDENCE_MODEL:-${HYA_DEEPSEEK_MODEL:-deepseek-flash}}"
+      HYA_DEEPSEEK_ATOMIC_MODEL: "${HYA_DEEPSEEK_ATOMIC_MODEL:-${HYA_DEEPSEEK_MODEL:-deepseek-flash}}"
+      HYA_DEEPSEEK_CONSOLIDATION_MODEL: "${HYA_DEEPSEEK_CONSOLIDATION_MODEL:-${HYA_DEEPSEEK_MODEL:-deepseek-flash}}"
+      HYA_DEEPSEEK_RETRIEVAL_MODEL: "${HYA_DEEPSEEK_RETRIEVAL_MODEL:-${HYA_DEEPSEEK_MODEL:-deepseek-flash}}"
+      HYA_DEEPSEEK_GOVERNANCE_MODEL: "${HYA_DEEPSEEK_GOVERNANCE_MODEL:-${HYA_DEEPSEEK_MODEL:-deepseek-flash}}"
+      HYA_LLM_BASE_URL: "${HYA_LLM_BASE_URL:-}"
+      HYA_LLM_MODEL: "${HYA_LLM_MODEL:-}"
+      HYA_LLM_API_KEY: "${HYA_LLM_API_KEY:-}"
+      HYA_ALLOW_EXTERNAL_LLM: "true"
+    volumes:
+      - hya_data:/var/lib/hear-you-are
+      - hya_models:/var/cache/hear-you-are
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    # No host port: all browser traffic must pass Caddy's authentication.
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      HYA_DOMAIN: "${HYA_DOMAIN:?Set HYA_DOMAIN in deploy/.env}"
+      HYA_DEMO_USER: "${HYA_DEMO_USER:?Set HYA_DEMO_USER in deploy/.env}"
+      HYA_PASSWORD_HASH: "${HYA_PASSWORD_HASH:?Set HYA_PASSWORD_HASH in deploy/.env}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+
+volumes:
+  hya_data:
+  hya_models:
+  caddy_data:
+  caddy_config:

@@ -1,4 +1,4 @@
-"""Portable local setup. Run with Python 3.11+; add --gpu for NVIDIA CUDA 12."""
+"""Portable CPU SenseVoice setup. Run with Python 3.11 or newer."""
 from __future__ import annotations
 
 import argparse
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gpu", action="store_true", help="安裝可選 NVIDIA CUDA 12 函式庫")
+    parser.add_argument("--download-models", action="store_true", help="下載 CPU 轉錄、VAD 及說話人分群模型")
     parser.add_argument("--dev", action="store_true", help="同時安裝 pytest 驗證工具")
     args = parser.parse_args()
     if sys.version_info < (3, 11):
@@ -22,8 +22,9 @@ def main():
     binary = env / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     if not binary.exists():
         venv.create(env, with_pip=True)
-    requirements = "requirements-gpu.txt" if args.gpu else "requirements.txt"
-    subprocess.run([str(binary), "-m", "pip", "install", "-r", requirements], cwd=ROOT, check=True)
+    subprocess.run([str(binary), "-m", "pip", "install", "-r", "requirements-sensevoice.txt"], cwd=ROOT, check=True)
+    if args.download_models:
+        subprocess.run([str(binary), "scripts/download_sensevoice_models.py"], cwd=ROOT, check=True)
     if args.dev:
         subprocess.run([str(binary), "-m", "pip", "install", "-r", "requirements-dev.txt"], cwd=ROOT, check=True)
     npm = shutil.which("npm.cmd" if sys.platform == "win32" else "npm")

@@ -1,0 +1,41 @@
+# Include only the source files required by the two Docker build stages.
+**
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!requirements-sensevoice.txt
+!scripts/
+!scripts/download_qwen_models.py
+!scripts/download_sensevoice_models.py
+!backend/
+!backend/__init__.py
+!backend/hya/
+!backend/hya/*.py
+!web/
+!web/package.json
+!web/package-lock.json
+!web/index.html
+!web/tsconfig.json
+!web/vite.config.ts
+!web/src/
+!web/src/**
+
+# Keep secrets, recordings, private artifacts, and local runtimes excluded even
+# if a future source directory contains one of these names.
+**/.env
+**/.env.*
+**/data
+**/data/**
+**/audio
+**/audio/**
+**/private
+**/private/**
+**/.venv
+**/.venv/**
+**/node_modules
+**/node_modules/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc
+**/*.log
+**/*.sqlite*

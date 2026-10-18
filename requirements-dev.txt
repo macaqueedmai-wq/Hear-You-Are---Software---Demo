@@ -1,2 +1,6 @@
 -r requirements.txt
+# Historical cloud-adapter contract regressions only.
+tencentcloud-sdk-python-asr>=3.1.177,<4
+# Legacy local-ASR regression tests remain available without making Whisper a runtime default.
+faster-whisper>=1.2,<2
 pytest>=8,<10

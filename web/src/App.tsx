@@ -20,7 +20,6 @@ import {
   LoaderCircle,
   LockKeyhole,
   MessageCircle,
-  MoreHorizontal,
   Play,
   Plus,
   RefreshCw,
@@ -32,64 +31,74 @@ import {
   Trash2,
   UploadCloud,
   Users,
-  WandSparkles,
   X,
 } from "lucide-react";
 import { SidebarItem } from "./components/SidebarItem";
 import { DatasetPanel } from "./components/DatasetPanel";
-import { api, ApiError } from "./api";
+import { api, ApiError, englishMessage } from "./api";
+import { buildTranscriptView, getSegmentId, isIdentityConfirmed, pendingSegmentIds, sanitizeSelection, toggleIds } from "./transcript";
+import { atomicTopicSections, buildRecordingTranscriptView, createTopicDraft, rebaseTopicDraft, topicPatch, topicDraftChanged, uploadingDateLabel } from "./topics";
+import { careConditionDisplay, careEmptyState, revealRequestedSupport, supportPreferenceEnabled, supportPreferencePatch } from "./proactive";
+import { createDisplayTimeDraft, displayTimePatch, formatSupportTime, rebaseDisplayTimeDraft, supportTimeLabels } from "./supportTiming";
+import type { DisplayTimeDraft } from "./supportTiming";
+import { dailySummaryContent, summaryGenerationDisplay } from "./summaries";
 import type {
   Card,
+  CareResponse,
   CareType,
   Category,
   Health,
   Memory,
+  MemoryPipeline,
+  Topic,
   Recording,
   Settings,
   Source,
   State,
+  SummaryGeneration,
 } from "./types";
 
 type View = "daily" | "import" | "memory" | "care";
 type Danger = { title: string; description: string; run: () => Promise<void> };
+type TopicDraft = ReturnType<typeof createTopicDraft> & { error: string; conflict: boolean; notice?: string };
+type DisplayTimeEditor = DisplayTimeDraft & { error: string; conflict: boolean; notice?: string };
 const categoryLabels: Record<Category, string> = {
-  mood: "心情與感受",
-  social: "社交與連結",
-  moments: "重要片刻",
+  mood: "Mood & feelings",
+  social: "Social & connection",
+  moments: "Memorable moments",
 };
 const careLabels: Record<CareType, string> = {
-  reminder: "提醒",
-  suggestion: "建議",
-  comfort: "安慰",
-  warning: "預警",
+  reminder: "Reminder",
+  suggestion: "Suggestion",
+  comfort: "Comfort",
+  warning: "Warning",
 };
 const categoryIcons = { mood: Heart, social: Users, moments: Sprout };
 const viewNames: Record<View, string> = {
-  daily: "今日卡片",
-  import: "錄音匯入",
-  memory: "記憶與來源",
-  care: "主動式 AI",
+  daily: "Daily cards",
+  import: "Import recording",
+  memory: "Atomic memories",
+  care: "Proactive AI",
 };
 const statusNames: Record<string, string> = {
-  queued: "等候處理",
-  processing: "正在轉寫",
-  transcribing: "正在轉寫",
-  ready: "轉寫完成",
-  completed: "轉寫完成",
-  pending: "等待確認",
-  failed: "處理失敗",
-  error: "處理失敗",
-  confirmed: "已確認",
-  active: "有效",
-  deleted: "已刪除",
-  superseded: "已更新",
-  uploaded: "已匯入",
+  queued: "Queued",
+  processing: "Transcribing",
+  transcribing: "Transcribing",
+  ready: "Transcribed",
+  completed: "Transcribed",
+  pending: "Awaiting confirmation",
+  failed: "Processing failed",
+  error: "Processing failed",
+  confirmed: "Confirmed",
+  active: "Active",
+  deleted: "Deleted",
+  superseded: "Updated",
+  uploaded: "Imported",
 };
 const scopeLabels: Record<string, string> = {
-  recorded_conversation: "該段對話",
-  stated_preference: "明確表達的偏好",
-  demo: "虛構演示",
-  current_context: "目前情境",
+  recorded_conversation: "This conversation",
+  stated_preference: "Explicitly stated preference",
+  current_context: "Current context",
 };
 function timeLabel(seconds: number) {
   return `${Math.floor(seconds / 60)
@@ -107,26 +116,76 @@ function localDate() {
   }).format(new Date());
 }
 function niceDate(date: string) {
-  return new Intl.DateTimeFormat("zh-Hant-HK", {
+  return new Intl.DateTimeFormat("en-GB", {
     month: "long",
     day: "numeric",
     weekday: "long",
     timeZone: "Asia/Hong_Kong",
   }).format(new Date(`${date}T12:00:00+08:00`));
 }
-function shortDate(date?: string | null) {
-  return date
-    ? new Intl.DateTimeFormat("zh-Hant-HK", {
-        month: "numeric",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-        timeZone: "Asia/Hong_Kong",
-      }).format(new Date(date))
-    : "錄音時間未提供";
-}
 function errorText(error: unknown) {
-  return error instanceof Error ? error.message : "操作未完成，請稍後重試。";
+  return error instanceof Error ? error.message : "The action did not complete. Please try again.";
+}
+
+function memoryTransferNotice(provider?: string) {
+  if (provider === "DeepSeek")
+    return "Transcript text and relevant memories are sent directly to the official DeepSeek API.";
+  if (provider === "A2Agent")
+    return "Transcript text and relevant memories are sent to DeepSeek through A2Agent, a third-party gateway.";
+  return "Transcript text and relevant memories are sent to the configured text-model endpoint.";
+}
+
+function transcriptionProviderLabel(provider: unknown) {
+  if (provider === "sensevoice") return "SenseVoiceSmall INT8";
+  if (provider === "qwen") return "Qwen3-ASR";
+  if (provider === "deepgram") return "Deepgram";
+  if (provider === "tencent") return "Tencent Cloud ASR";
+  if (provider === "whisper") return "Local transcription model";
+  return "the configured transcription service";
+}
+
+function anonymousSpeakerLabel(label?: string | number | null) {
+  if (label === undefined || label === null || String(label) === "unknown" || String(label) === "") return "";
+  return `Speaker ${String(label).replace(/^speaker_/, "")}`;
+}
+
+const transcriptionStageNames: Record<string, string> = {
+  loading_asr: "Loading transcription model",
+  transcribing: "Transcribing",
+  loading_aligner: "Loading alignment model",
+  aligning: "Estimating word timing",
+  diarizing: "Distinguishing speakers",
+};
+function PipelineProgress({ pipeline, recording }: { pipeline?: MemoryPipeline | null; recording?: Recording }) {
+  if (!pipeline && !recording) return null;
+  const transcribing = ["queued", "processing", "transcribing"].includes(recording?.status || "");
+  const organizing = ["pending", "processing"].includes(recording?.topic_pipeline?.status || "");
+  const working = transcribing || organizing || ["pending", "processing"].includes(pipeline?.status || "");
+  const error = recording?.topic_pipeline?.error || pipeline?.error;
+  const failed = recording?.topic_pipeline?.status === "failed" || pipeline?.status === "failed";
+  return <div className="small-text processing-progress" role="status" aria-live="polite">
+    <p><strong>Transcribing → Atomic memories → Topics</strong></p>
+    <p>{working && <LoaderCircle size={13} className="spin" />} {transcribing ? "Transcribing automatically" : organizing ? "Organizing topics automatically" : failed ? "Processing did not complete" : working ? pipeline?.stage === "atomic" ? "Building atomic memories" : "Preparing topics and summaries" : recording?.topics?.length ? "Atomic memories and topics ready" : "Automatic processing"}</p>
+    {error && <p className="error-text">{englishMessage(error)}</p>}
+  </div>;
+}
+
+function SelectionCheckbox({ label, ariaLabel, checked, indeterminate = false, disabled, onChange }: {
+  label: string; ariaLabel?: string; checked: boolean; indeterminate?: boolean;
+  disabled: boolean; onChange: (checked: boolean) => void;
+}) {
+  const checkbox = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (checkbox.current) checkbox.current.indeterminate = indeterminate;
+  }, [indeterminate]);
+  return (
+    <label className="transcript-checkbox">
+      <input ref={checkbox} type="checkbox" checked={checked} disabled={disabled}
+        aria-label={ariaLabel || label} aria-checked={indeterminate ? "mixed" : checked}
+        onChange={(event) => onChange(event.target.checked)} />
+      <span>{label}</span>
+    </label>
+  );
 }
 
 function Modal({
@@ -190,7 +249,7 @@ function Modal({
       >
         <div className="modal-head">
           <h2>{title}</h2>
-          <button className="icon-button" onClick={close} aria-label="關閉視窗">
+          <button className="icon-button" onClick={close} aria-label="Close dialog">
             <X size={20} />
           </button>
         </div>
@@ -222,73 +281,16 @@ function Empty({
 }
 
 /** Card anatomy adapted from MoodHaven InsightCard.tsx (MIT): heading, message, evidence. */
-function DailyCard({
-  card,
-  open,
-  confirm,
-  busy,
-}: {
-  card: Card;
-  open: () => void;
-  confirm: () => void;
-  busy: boolean;
-}) {
+function DailyCard({ card, generation, open, edit, busy }: { card: Card; generation?: SummaryGeneration; open: () => void; edit: () => void; busy: boolean }) {
   const Icon = categoryIcons[card.category] || Sprout;
-  return (
-    <article className={`daily-card category-${card.category}`}>
-      <div className="card-topline">
-        <span className="category-icon">
-          <Icon size={22} />
-        </span>
-        <span className="eyebrow">{categoryLabels[card.category]}</span>
-        <span className="card-more" aria-hidden="true">
-          <MoreHorizontal size={21} />
-        </span>
-      </div>
-      <h3>{card.title}</h3>
-      <p className="card-summary">{card.summary}</p>
-      <div className="card-tags">
-        {card.analysis_mode === "llm" && <span className="tag">模型整理</span>}
-        {card.is_demo && <span className="tag tag-demo">含虛構演示</span>}
-        <span className="tag">
-          {card.review_status === "confirmed" ? "理解已核實" : "理解待核實"}
-        </span>
-      </div>
-      {card.review_status !== "confirmed" && (
-        <div className="review-question">
-          <MessageCircle size={16} />
-          <p>
-            {card.review_prompt ||
-              "這些事情有發生嗎？我有理解對你嗎？需要怎樣修改？"}
-          </p>
-        </div>
-      )}
-      <div className="review-actions">
-        <button
-          className="small-button"
-          onClick={confirm}
-          disabled={
-            busy || card.review_status === "confirmed" || !card.review_token
-          }
-        >
-          <Check size={14} />
-          {card.review_status === "confirmed" ? "理解已核實" : "理解正確"}
-        </button>
-        <button className="small-button ghost" onClick={open}>
-          需要修改
-        </button>
-      </div>
-      <div className="card-footer">
-        <span>
-          <AudioLines size={14} />
-          {card.memory_ids?.length || 0} 則記憶依據
-        </span>
-        <button className="text-button" onClick={open}>
-          查看來源 <ArrowRight size={15} />
-        </button>
-      </div>
-    </article>
-  );
+  const content = dailySummaryContent(card, generation);
+  return <article className={`daily-card category-${card.category}`}>
+    <div className="card-topline"><span className="category-icon"><Icon size={22} /></span><span className="eyebrow">{categoryLabels[card.category]}</span></div>
+    <h3>{card.title}</h3><p className="card-summary">{content.summary}</p>
+    <div className="card-tags"><span className="tag">{content.tag}</span></div>
+    <div className="review-actions"><button className="small-button" disabled={busy} onClick={open}>Sources</button><button className="small-button ghost" disabled={busy} onClick={edit}>Edit topic</button></div>
+    <div className="card-footer"><span><AudioLines size={14} />{card.memory_ids?.length || 0} atomic memories</span></div>
+  </article>;
 }
 
 function CareCard({
@@ -296,6 +298,7 @@ function CareCard({
   feedback,
   open,
   memories,
+  recordings,
   openMemory,
   schedule,
   busy,
@@ -304,6 +307,7 @@ function CareCard({
   feedback: (id: string, action: string) => void;
   open: () => void;
   memories: Memory[];
+  recordings: Recording[];
   openMemory: (id: string) => void;
   schedule: (card: Card, dueAt: string) => Promise<boolean>;
   busy: boolean;
@@ -322,16 +326,19 @@ function CareCard({
       !card.historical_memory_ids?.includes(memory.id),
   );
   const supportLabels = {
-    sleep_pattern: "跨日睡眠記錄",
-    social_follow_up: "社交狀況跟進",
-    emotional_follow_up: "情緒狀況跟進",
-    current_request: "當前明確需要",
+    sleep_pattern: "Sleep record across days",
+    social_follow_up: "Social follow-up",
+    emotional_follow_up: "Emotional follow-up",
+    current_request: "Current explicit need",
+    acute_distress: "Strong distress in your current words",
+    repeated_distress: "Emotional or social strain across days",
+    fictional_warning: "Fictional warning demonstration",
   };
   async function scheduleBedtime(event: FormEvent) {
     event.preventDefault();
     setScheduleError("");
     if (!bedtime || new Date(`${bedtime}:00+08:00`).getTime() <= Date.now()) {
-      setScheduleError("請選擇未來的香港時間。");
+      setScheduleError("Choose a future Hong Kong time.");
       return;
     }
     if (await schedule(card, `${bedtime}:00+08:00`)) {
@@ -339,11 +346,11 @@ function CareCard({
       setBedtime("");
     } else
       setScheduleError(
-        "提醒未能設定。請查看上方訊息，重新檢查來源或再試一次。",
+        "The reminder could not be set. Check the message above, review the sources, then try again.",
       );
   }
   return (
-    <article className={`care-card care-${type}`}>
+    <article id={`care-card-${card.id}`} tabIndex={-1} aria-label={`${careLabels[type]}: ${card.title}`} className={`care-card care-${type}`}>
       <div className="care-card-heading">
         <span className="care-symbol">
           {type === "comfort" ? (
@@ -355,18 +362,18 @@ function CareCard({
           )}
         </span>
         <div>
-          <span className="eyebrow">
-            {careLabels[type]}
-            {card.is_demo ? " · 含虛構演示" : ""}
-          </span>
+          <span className="eyebrow">{careLabels[type]}</span>
           <h3>{card.title}</h3>
         </div>
       </div>
+      {type === "warning" && card.demo_only === true && <div className="support-label">Fictional demo</div>}
+      {card.delivery_mode === "requested" && <div className="support-label"><Heart size={13} />Requested now · Your automatic support schedule is unchanged</div>}
+      {formatSupportTime(card.displayed_at) && <p className="small-text muted"><time dateTime={card.displayed_at!}>Displayed · {formatSupportTime(card.displayed_at)}</time></p>}
       <p>{card.summary || card.action_text}</p>
       <div className="condition">
         <ShieldCheck size={16} />
         <span>
-          <strong>觸發依據</strong>
+          <strong>{type === "warning" ? "Why this warning" : "Why this appeared"}</strong>
           {card.condition_reason}
         </span>
       </div>
@@ -380,17 +387,14 @@ function CareCard({
         <div className="support-sources">
           {historical.length > 0 && (
             <div>
-              <h4>過往記錄</h4>
+              <h4>Earlier records</h4>
               {historical.map((memory) => (
                 <button
                   className="support-source"
                   key={memory.id}
                   onClick={() => openMemory(memory.id)}
                 >
-                  <span>
-                    {shortDate(memory.event_time)}
-                    {memory.is_demo && <i>虛構演示</i>}
-                  </span>
+                  <span>{uploadingDateLabel(recordings.find((recording) => recording.id === memory.recording_id))}</span>
                   <strong>{memory.content}</strong>
                   <ArrowRight size={13} />
                 </button>
@@ -399,17 +403,14 @@ function CareCard({
           )}
           {current.length > 0 && (
             <div>
-              <h4>當前記錄</h4>
+              <h4>Current records</h4>
               {current.map((memory) => (
                 <button
                   className="support-source"
                   key={memory.id}
                   onClick={() => openMemory(memory.id)}
                 >
-                  <span>
-                    {shortDate(memory.event_time)}
-                    {memory.is_demo && <i>虛構演示</i>}
-                  </span>
+                  <span>{uploadingDateLabel(recordings.find((recording) => recording.id === memory.recording_id))}</span>
                   <strong>{memory.content}</strong>
                   <ArrowRight size={13} />
                 </button>
@@ -427,14 +428,14 @@ function CareCard({
               onClick={() => setShowSchedule(true)}
             >
               <Bell size={14} />
-              設定睡覺提醒
+              Set a bedtime reminder
             </button>
           ) : (
             <form onSubmit={(event) => void scheduleBedtime(event)}>
               <label>
-                你想何時收到睡覺提醒？（香港時間）
+                When would you like the bedtime reminder? (Hong Kong time)
                 <input
-                  aria-label="睡覺提醒時間"
+                  aria-label="Bedtime reminder time"
                   type="datetime-local"
                   required
                   value={bedtime}
@@ -456,19 +457,19 @@ function CareCard({
                   disabled={busy || !bedtime}
                 >
                   <Check size={14} />
-                  允許並設定提醒
+                  Allow and set reminder
                 </button>
                 <button
                   className="text-button"
                   type="button"
                   onClick={() => setShowSchedule(false)}
                 >
-                  取消
+                  Cancel
                 </button>
               </div>
             </form>
           )}
-          <p>只有你明確設定後才建立提醒；應用開啟時檢查，沒有系統背景鬧鐘。</p>
+          <p>A reminder is created only when you set it explicitly. It is checked while the app is open; there is no background system alarm.</p>
         </div>
       )}
       <div className="care-actions">
@@ -480,7 +481,7 @@ function CareCard({
           }
         >
           <Check size={15} />
-          {type === "reminder" ? "已完成" : "對我有幫助"}
+          {type === "reminder" ? "Done" : "This helped"}
         </button>
         <button
           className="small-button ghost"
@@ -488,14 +489,14 @@ function CareCard({
           onClick={() => feedback(card.id, "snooze")}
         >
           <Clock3 size={14} />
-          稍後再看
+          Show later
         </button>
         <button className="text-button" onClick={open}>
-          來源 <ArrowRight size={14} />
+          Sources <ArrowRight size={14} />
         </button>
         <button
           className="icon-button"
-          aria-label="略過這張關懷卡片"
+          aria-label="Dismiss this care card"
           disabled={busy}
           onClick={() => feedback(card.id, "dismiss")}
         >
@@ -516,7 +517,6 @@ export default function App() {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState("");
   const [showSettings, setShowSettings] = useState(false);
-  const [showDemo, setShowDemo] = useState(false);
   const [danger, setDanger] = useState<Danger | null>(null);
   const [source, setSource] = useState<Source | null>(null);
   const [drawerRecording, setDrawerRecording] = useState<Recording | null>(
@@ -524,15 +524,16 @@ export default function App() {
   );
   const [sourceLoading, setSourceLoading] = useState(false);
   const [sourceError, setSourceError] = useState("");
-  const [edit, setEdit] = useState("");
-  const [dueAt, setDueAt] = useState("");
-  const [allowFollowup, setAllowFollowup] = useState(false);
-  const [conflict, setConflict] = useState(false);
   const [selectedSegments, setSelectedSegments] = useState<string[]>([]);
+  const [topicEditor, setTopicEditor] = useState<TopicDraft | null>(null);
+  const topicSaveInFlight = useRef(false);
+  const supportRequestInFlight = useRef(false);
+  const displayTimeSaveInFlight = useRef(false);
+  const [supportResultToFocus, setSupportResultToFocus] = useState<string | null>(null);
+  const [displayTimeEditor, setDisplayTimeEditor] = useState<DisplayTimeEditor | null>(null);
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("all");
   const [file, setFile] = useState<File | null>(null);
-  const [recordedAt, setRecordedAt] = useState("");
   const [dragging, setDragging] = useState(false);
   const audioRef = useRef<HTMLAudioElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -541,11 +542,16 @@ export default function App() {
     setSource(null);
     setDrawerRecording(null);
     setSourceError("");
-    setConflict(false);
+    setSelectedSegments([]);
   }, []);
   const closeSettings = useCallback(() => setShowSettings(false), []);
-  const closeDemo = useCallback(() => setShowDemo(false), []);
   const closeDanger = useCallback(() => setDanger(null), []);
+  const closeTopicEditor = useCallback(() => {
+    if (!topicSaveInFlight.current) setTopicEditor(null);
+  }, []);
+  const closeDisplayTimeEditor = useCallback(() => {
+    if (!displayTimeSaveInFlight.current) setDisplayTimeEditor(null);
+  }, []);
 
   const refresh = useCallback(
     async (selected = date, silent = false) => {
@@ -560,6 +566,7 @@ export default function App() {
         setState(next);
         setHealth(status);
         setError("");
+        return next;
       } catch (err) {
         setError(errorText(err));
       } finally {
@@ -572,9 +579,10 @@ export default function App() {
     void refresh();
   }, [refresh]);
   useEffect(() => {
-    const timer = window.setInterval(() => void refresh(date, true), 5000);
+    const interval = summaryGenerationDisplay(state?.summary_generation).polling || state?.care_generation?.status === "pending" ? 2000 : 5000;
+    const timer = window.setInterval(() => void refresh(date, true), interval);
     return () => window.clearInterval(timer);
-  }, [refresh, date]);
+  }, [refresh, date, state?.summary_generation?.status, state?.care_generation?.status]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(""), 7000);
@@ -606,15 +614,11 @@ export default function App() {
   async function openMemory(id: string) {
     setSourceLoading(true);
     setSourceError("");
-    setConflict(false);
     setSource(null);
     setDrawerRecording(null);
     try {
       const next = await api<Source>(`/memories/${id}/source`);
       setSource(next);
-      setEdit(next.memory.content);
-      setAllowFollowup(Boolean(next.memory.follow_up?.allowed));
-      setDueAt(next.memory.follow_up?.due_at?.slice(0, 16) || "");
       setSelectedSegments([]);
     } catch (err) {
       setSourceError(errorText(err));
@@ -622,34 +626,129 @@ export default function App() {
       setSourceLoading(false);
     }
   }
+  async function requestSupport(type: CareType) {
+    if (supportRequestInFlight.current) return;
+    supportRequestInFlight.current = true;
+    setBusy(`display-now-${type}`);
+    setError("");
+    try {
+      const result = await api<CareResponse>("/proactive/display-now", {
+        method: "POST", body: JSON.stringify({ type, date: selectedDate }),
+      });
+      setState((previous) => previous ? { ...previous, proactive: result.cards, assessment: result.assessment, care_generation: result.care_generation } : previous);
+      await refresh(date, true);
+      const requestedCard = result.cards.find((card) => card.type === type);
+      if (requestedCard) setSupportResultToFocus(requestedCard.id);
+      setNotice(requestedCard ? `Your ${careLabels[type].toLowerCase()} card is ready.` : result.care_generation?.message || "Your support request was checked.");
+    } catch (err) {
+      await refresh(date, true);
+      setError(errorText(err));
+    } finally {
+      supportRequestInFlight.current = false;
+      setBusy("");
+    }
+  }
+  function openDisplayTimeEditor(type: CareType) {
+    const timing = state?.assessment.types?.[type]?.display_time;
+    if (timing) setDisplayTimeEditor({ ...createDisplayTimeDraft(type, timing), error: "", conflict: false });
+  }
+  async function saveDisplayTime(event: FormEvent) {
+    event.preventDefault();
+    const draft = displayTimeEditor;
+    if (!draft || busy || draft.conflict) return;
+    let patch;
+    try { patch = displayTimePatch(draft); }
+    catch (err) { setDisplayTimeEditor((previous) => previous ? { ...previous, error: errorText(err) } : previous); return; }
+    displayTimeSaveInFlight.current = true;
+    setBusy("save-display-time");
+    try {
+      await api<State>("/proactive/display-time", { method: "PATCH", body: JSON.stringify(patch) });
+      await refresh(date, true);
+      setDisplayTimeEditor(null);
+      setNotice(patch.display_at ? `${careLabels[draft.type]} display time saved.` : `${careLabels[draft.type]} returned to automatic timing.`);
+    } catch (err) {
+      setDisplayTimeEditor((previous) => previous ? { ...previous, error: errorText(err), conflict: err instanceof ApiError && err.status === 409 } : previous);
+    } finally {
+      displayTimeSaveInFlight.current = false;
+      setBusy("");
+    }
+  }
+  async function refreshDisplayTimeDraft() {
+    const draft = displayTimeEditor;
+    if (!draft || busy) return;
+    displayTimeSaveInFlight.current = true;
+    setBusy("refresh-display-time");
+    try {
+      const snapshot = await refresh(date, true);
+      const timing = snapshot?.assessment.types?.[draft.type]?.display_time;
+      if (!timing) throw new Error("Display-time information could not be refreshed. Your draft is unchanged.");
+      setDisplayTimeEditor({ ...rebaseDisplayTimeDraft(draft, timing), error: "", conflict: false,
+        notice: `Latest saved display time: ${supportTimeLabels(timing).scheduled}. Your entries are unchanged; compare them before saving.` });
+    } catch (err) {
+      setDisplayTimeEditor((previous) => previous ? { ...previous, error: errorText(err) } : previous);
+    } finally { displayTimeSaveInFlight.current = false; setBusy(""); }
+  }
   function openRecording(recording: Recording) {
     setSource(null);
     setDrawerRecording(recording);
     setSelectedSegments([]);
     setSourceError("");
-    setConflict(false);
   }
   function openCard(card: Card) {
     if (card.memory_ids?.[0]) void openMemory(card.memory_ids[0]);
-    else setNotice("這張卡片目前沒有可查看的有效來源。");
+    else setNotice("This card has no valid sources to view right now.");
   }
-  async function confirmCard(card: Card) {
-    if (!card.review_token) {
-      setError("卡片需要重新整理後才能核實。");
-      return;
+  function openTopicEditor(recording: Recording, topic: Topic) {
+    setTopicEditor({ ...createTopicDraft(recording, topic, state?.memories || []), error: "", conflict: false });
+  }
+  function editCardTopic(card: Card) {
+    for (const recording of state?.recordings || []) {
+      const topic = recording.topics?.find((item) => item.memory_ids.some((id) => card.memory_ids.includes(id)));
+      if (topic) { openTopicEditor(recording, topic); return; }
     }
-    await run(
-      `review-${card.id}`,
-      () =>
-        api(`/cards/${card.id}/confirm`, {
-          method: "POST",
-          body: JSON.stringify({
-            expected_versions: card.versions,
-            review_token: card.review_token,
-          }),
-        }),
-      "已核實這張卡片的理解。主動支持會依據已核實記憶重新評估。",
-    );
+    openCard(card);
+    setNotice("Topics are being organized automatically. Original sources remain available.");
+  }
+  async function saveTopic(event: FormEvent) {
+    event.preventDefault();
+    const draft = topicEditor;
+    if (!draft || busy || draft.conflict) return;
+    let body;
+    try { body = topicPatch(draft); }
+    catch (err) { setTopicEditor((previous) => previous ? { ...previous, error: errorText(err) } : previous); return; }
+    topicSaveInFlight.current = true;
+    setBusy("save-topic");
+    try {
+      const updated = await api<Recording>(`/recordings/${encodeURIComponent(draft.recordingId)}/topics/${encodeURIComponent(draft.topicId)}`, {
+        method: "PATCH", body: JSON.stringify(body),
+      });
+      if (drawerRecording?.id === updated.id) setDrawerRecording(updated);
+      await refresh(date, true);
+      if (source?.recording.id === updated.id) await openMemory(source.memory.id);
+      setTopicEditor(null);
+      setNotice("Topic and atomic memories saved. Original audio, source fragments and speaker identity remain unchanged.");
+    } catch (err) {
+      setTopicEditor((previous) => previous ? { ...previous, conflict: err instanceof ApiError && err.status === 409,
+        error: err instanceof ApiError && err.status === 409 ? "This topic or an atomic memory changed elsewhere. Your draft is preserved. Refresh saved values, compare them, then save explicitly." : errorText(err),
+      } : previous);
+    } finally { topicSaveInFlight.current = false; setBusy(""); }
+  }
+  async function refreshTopicDraft() {
+    const draft = topicEditor;
+    if (!draft || busy) return;
+    topicSaveInFlight.current = true;
+    setBusy("refresh-topic");
+    try {
+      const snapshot = await refresh(date, true);
+      const recording = snapshot?.recordings.find((item) => item.id === draft.recordingId);
+      const topic = recording?.topics?.find((item) => item.id === draft.topicId);
+      if (!snapshot || !recording || !topic) throw new Error("This topic is no longer available. Your draft is still here; copy it before closing.");
+      setTopicEditor((previous) => previous?.topicId === draft.topicId ? { ...previous,
+        ...rebaseTopicDraft(previous, recording, topic, snapshot.memories), error: "", conflict: false,
+        notice: "Saved values and versions are refreshed below. Your entries are unchanged; compare them before saving.",
+      } : previous);
+    } catch (err) { setTopicEditor((previous) => previous ? { ...previous, error: errorText(err) } : previous); }
+    finally { topicSaveInFlight.current = false; setBusy(""); }
   }
   const scheduleBedtime = (card: Card, dueAt: string) =>
     run(
@@ -662,59 +761,19 @@ export default function App() {
             expected_versions: card.versions,
           }),
         }),
-      "已按你的選擇設定睡覺提醒。到期時，應用需保持開啟才能檢查。",
+      "Bedtime reminder set. The app must stay open for it to be checked when due.",
     );
-  async function saveMemory(event: FormEvent) {
-    event.preventDefault();
-    if (!source || !edit.trim()) return;
-    if (allowFollowup && !dueAt) {
-      setSourceError("請先提供跟進時間，或取消允許跟進。");
-      return;
-    }
-    setBusy("save-memory");
-    setSourceError("");
-    try {
-      await api(`/memories/${source.memory.id}`, {
-        method: "PATCH",
-        body: JSON.stringify({
-          content: edit.trim(),
-          version: source.memory.version,
-          confirmed: true,
-          follow_up:
-            allowFollowup && dueAt
-              ? {
-                  due_at: `${dueAt}:00+08:00`,
-                  allowed: true,
-                  completed: source.memory.follow_up?.completed || false,
-                }
-              : {
-                  due_at: source.memory.follow_up?.due_at || null,
-                  allowed: false,
-                  completed: source.memory.follow_up?.completed || false,
-                },
-        }),
-      });
-      await refresh(date, true);
-      await openMemory(source.memory.id);
-      setNotice("記憶已更新；相關卡片已重算，舊提示已取消。");
-    } catch (err) {
-      setConflict(err instanceof ApiError && err.status === 409);
-      setSourceError(errorText(err));
-    } finally {
-      setBusy("");
-    }
-  }
   async function upload(event: FormEvent) {
     event.preventDefault();
     if (!file) return;
-    if (file.size > 100 * 1024 * 1024) {
-      setError("檔案超過 100 MB。請先剪輯或壓縮，再匯入。");
+    const uploadLimit = Number(health?.asr?.max_upload_bytes) / 1024 / 1024 || Number(health?.asr?.max_upload_mb) || 100;
+    if (file.size > uploadLimit * 1024 * 1024) {
+      setError(`The file exceeds ${uploadLimit} MB. Trim or compress it, then import again.`);
       return;
     }
     const body = new FormData();
     body.append("file", file);
     body.append("language", "en");
-    if (recordedAt) body.append("recorded_at", `${recordedAt}:00+08:00`);
     setBusy("upload");
     setError("");
     try {
@@ -728,8 +787,8 @@ export default function App() {
       setDate("");
       setNotice(
         result.duplicate
-          ? "這個錄音已匯入，已保留原有來源，沒有重複增加證據。"
-          : "錄音已匯入。轉寫完成後，請確認哪些片段是你說的。",
+          ? "This recording was already imported; the existing source was kept and no duplicate evidence was added."
+          : "Recording uploaded. Transcribing → Atomic memories → Topics runs automatically; choose your own speaker segments separately.",
       );
     } catch (err) {
       setError(errorText(err));
@@ -738,17 +797,18 @@ export default function App() {
     }
   }
   async function confirmSegments() {
-    const recording = drawerRecording || source?.recording;
-    if (!recording || selectedSegments.length === 0) return;
+    const recording = activeRecording;
+    const ids = sanitizeSelection(selectedSegments, pendingSegmentIds(segments));
+    if (!recording || !ids.length || transcriptBusy) return;
     setBusy("confirm");
     setSourceError("");
     try {
       await api(`/recordings/${recording.id}/confirm`, {
         method: "POST",
-        body: JSON.stringify({ segment_ids: selectedSegments }),
+        body: JSON.stringify({ segment_ids: ids }),
       });
       await refresh(date, true);
-      setNotice("已確認所選片段屬於你，記憶與卡片已更新。");
+      setNotice("Selected segments confirmed as yours; memories and cards updated.");
       closeDrawer();
     } catch (err) {
       setSourceError(errorText(err));
@@ -758,9 +818,9 @@ export default function App() {
   }
   function deleteMemory(memory: Memory) {
     setDanger({
-      title: "刪除這則記憶？",
+      title: "Delete this memory?",
       description:
-        "此記憶及歷史版本的內容會清除，相關卡片及提示亦會更新。原始錄音仍保留；如需移除整段錄音，請到錄音匯入頁。",
+        "This memory and its version history will be cleared, and related cards and suggestions will update. The original recording is kept; to remove the whole recording, go to the Import recording page.",
       run: async () => {
         await api(`/memories/${memory.id}`, { method: "DELETE" });
         closeDrawer();
@@ -769,9 +829,9 @@ export default function App() {
   }
   function deleteRecording(recording: Recording) {
     setDanger({
-      title: "刪除這段錄音及相關記憶？",
+      title: "Delete this recording and its memories?",
       description:
-        "此操作會移除本機錄音檔、逐字稿及關聯記憶和歷史，並更新相關卡片。刪除後無法復原。",
+        "This removes the local audio file, transcript, related memories and history, and updates related cards. This cannot be undone.",
       run: async () => {
         await api(`/recordings/${recording.id}`, { method: "DELETE" });
         if (
@@ -782,6 +842,18 @@ export default function App() {
       },
     });
   }
+  async function understandRecording(recording: Recording) {
+    await run(
+      `understand-${recording.id}`,
+      async () => {
+        const next = await api<Recording>(`/recordings/${recording.id}/${recording.topic_pipeline?.status === "failed" ? "organize" : "understand"}`, {
+          method: "POST",
+        });
+        if (drawerRecording?.id === recording.id) setDrawerRecording(next);
+      },
+      "Automatic processing retry started.",
+    );
+  }
   const feedback = (id: string, action: string) =>
     void run(
       `feedback-${id}`,
@@ -791,10 +863,10 @@ export default function App() {
           body: JSON.stringify({ action }),
         }),
       action === "done"
-        ? "事項已標示完成。"
+        ? "Item marked as done."
         : action === "snooze"
-          ? "已稍後再看。此操作只更改接收狀態。"
-          : "已記錄你的回饋。",
+          ? "Snoozed. This only changes how the card is shown."
+          : "Your feedback was recorded.",
     );
   const memories = (state?.memories || []).filter(
     (memory) => memory.status !== "deleted" && memory.status !== "superseded",
@@ -803,9 +875,6 @@ export default function App() {
     (memory) =>
       (filter === "all" ||
         memory.category === filter ||
-        (filter === "review_pending" &&
-          !memory.reviewed &&
-          memory.subject_id === "user") ||
         memory.status === filter) &&
       `${memory.content} ${memory.scope}`
         .toLowerCase()
@@ -818,8 +887,7 @@ export default function App() {
     (recording) =>
       !recording.is_demo &&
       recording.segments?.some(
-        (segment) =>
-          segment.subject_id !== "user" && segment.speaker !== "user",
+        (segment) => !isIdentityConfirmed(segment),
       ),
   );
   const activeMemories = memories.filter(
@@ -828,27 +896,53 @@ export default function App() {
   const drawerVisible = Boolean(
     source || drawerRecording || sourceLoading || sourceError,
   );
-  const activeRecording = drawerRecording || source?.recording;
-  const segments = source?.segments || drawerRecording?.segments || [];
-  const requiresSubjectConfirmation = Boolean(
-    source &&
-      (source.memory.subject_id !== "user" ||
-        segments.some(
-          (segment) =>
-            segment.subject_id !== "user" && segment.speaker !== "user",
-        )),
-  );
+  const selectedRecording = drawerRecording || source?.recording;
+  const activeRecording = recordings.find(
+    (recording) => recording.id === selectedRecording?.id,
+  ) || selectedRecording;
+  const segments = source?.segments || activeRecording?.segments || [];
+  const selectableSegmentIds = pendingSegmentIds(segments);
+  const effectiveSelection = sanitizeSelection(selectedSegments, selectableSegmentIds);
+  const transcriptView = source
+    ? { ...buildTranscriptView(segments), reason: "These are this memory's cited source fragments, shown without full-topic summaries." }
+    : activeRecording ? buildRecordingTranscriptView(activeRecording) : buildTranscriptView(segments);
+  const sourceTopic = source ? activeRecording?.topics?.find((topic) => topic.memory_ids.includes(source.memory.id)) : undefined;
+  const transcriptBusy = Boolean(busy) || ["pending", "processing"].includes(activeRecording?.topic_pipeline?.status || "") || ["queued", "processing"].includes(activeRecording?.status || "")
+    || ["pending", "processing"].includes(activeRecording?.memory_pipeline?.status || "");
+  const selectionSourceKey = JSON.stringify([drawerVisible, source?.memory.id, activeRecording?.id, activeRecording?.created_at,
+    segments.map((segment) => [getSegmentId(segment), segment.start, segment.end, segment.text,
+      segment.speaker_label, segment.subject_id, segment.speaker, segment.confirmed])]);
+  useEffect(() => {
+    setSelectedSegments([]);
+  }, [selectionSourceKey]);
   const asr = health?.asr;
-  const modelStatus = asr?.loaded
-    ? "模型已載入"
+  const hosted = health?.deployment?.mode === "server";
+  const externalAsr = Boolean(asr?.external);
+  const asrProvider = transcriptionProviderLabel(asr?.provider);
+  const asrModel = String(asr?.model || health?.model || "Configured by the backend");
+  const maxUploadMb = Number(asr?.max_upload_bytes) / 1024 / 1024 || Number(asr?.max_upload_mb) || 100;
+  const memoryPipeline = health?.memory_pipeline;
+  const modelStatus = transcriptionStageNames[String(asr?.state || "")] || (asr?.loaded
+    ? externalAsr ? "ASR configured" : "Model loaded"
     : asr?.available
-      ? "首次使用時載入"
+      ? externalAsr ? "ASR configured" : ["qwen", "sensevoice"].includes(String(asr?.provider)) ? "Loads on demand" : "Loads on first use"
       : health
-        ? "等待設定模型"
-        : "連線中";
+        ? "Waiting for ASR setup"
+        : "Connecting");
   const currentCards = state?.cards || [];
+  const summaryStatus = summaryGenerationDisplay(state?.summary_generation);
+  const showSummaryStatus = state?.summary_generation?.status !== "ready";
+  const atomicSections = atomicTopicSections(recordings, filteredMemories);
   const careCards = state?.proactive || [];
-  const selectedCareType = state?.assessment?.matched_types || [];
+  const careEmpty = careEmptyState(state?.care_generation, busy.startsWith("display-now-"));
+  useEffect(() => {
+    if (!supportResultToFocus) return;
+    if (view !== "care") { setSupportResultToFocus(null); return; }
+    if (careCards.some((card) => card.id === supportResultToFocus)
+      && revealRequestedSupport(supportResultToFocus, (id) => document.getElementById(id))) {
+      setSupportResultToFocus(null);
+    }
+  }, [supportResultToFocus, view, careCards]);
 
   return (
     <div className="app-shell">
@@ -860,39 +954,39 @@ export default function App() {
             event.preventDefault();
             setView("daily");
           }}
-          aria-label="Hear You Are 首頁"
+          aria-label="Hear You Are home"
         >
           <span className="brand-mark">
             <Ear size={27} />
             <span />
           </span>
           <span>
-            Hear You Are<small>讓每一天，都被聽見</small>
+            Hear You Are<small>Every day, heard</small>
           </span>
         </a>
-        <div className="workspace-label">你的日常空間</div>
-        <nav aria-label="主要導覽">
+        <div className="workspace-label">Your everyday space</div>
+        <nav aria-label="Main navigation">
           <SidebarItem
             icon={<Layers3 size={19} />}
-            label="今日卡片"
+            label="Daily cards"
             isActive={view === "daily"}
             onClick={() => setView("daily")}
           />
           <SidebarItem
             icon={<AudioLines size={19} />}
-            label="錄音匯入"
+            label="Import recording"
             isActive={view === "import"}
             onClick={() => setView("import")}
           />
           <SidebarItem
             icon={<Database size={19} />}
-            label="記憶與來源"
+            label="Atomic memories"
             isActive={view === "memory"}
             onClick={() => setView("memory")}
           />
           <SidebarItem
             icon={<Sparkles size={19} />}
-            label="主動式 AI"
+            label="Proactive AI"
             isActive={view === "care"}
             onClick={() => setView("care")}
           />
@@ -900,9 +994,9 @@ export default function App() {
         <div className="sidebar-note">
           <div className="note-line">
             <LockKeyhole size={16} />
-            <strong>你的記憶，由你掌握</strong>
+            <strong>Your memories, in your hands</strong>
           </div>
-          <p>隨時查看原話、修正理解，或刪除不想保留的內容。</p>
+          <p>Revisit the original words, correct the understanding, or delete anything you do not want to keep.</p>
         </div>
         <div className="sidebar-bottom">
           <button
@@ -910,14 +1004,14 @@ export default function App() {
             onClick={() => setShowSettings(true)}
           >
             <Settings2 size={18} />
-            偏好與模型
+            Preferences & model
             <span className="status-dot" />
           </button>
           <div className="profile">
-            <span className="avatar">你</span>
+            <span className="avatar">You</span>
             <div>
-              <strong>我的日常</strong>
-              <small>本機軟件 · MVP</small>
+              <strong>My everyday</strong>
+              <small>{hosted ? "Hosted demo · Shared workspace" : "Local app · MVP"}</small>
             </div>
             <span className="profile-dot" />
           </div>
@@ -926,7 +1020,7 @@ export default function App() {
       <main className="main">
         <header className="topbar">
           <div className="breadcrumb">
-            我的空間<span>/</span>
+            My space<span>/</span>
             <strong>{viewNames[view]}</strong>
           </div>
           <div className="topbar-actions">
@@ -934,11 +1028,15 @@ export default function App() {
               <span
                 className={`status-dot ${error && !state ? "offline" : ""}`}
               />
-              {error && !state ? "服務未連線" : "本機運行"}
+              {error && !state
+                ? "Service offline"
+                : hosted
+                  ? "Running on server"
+                  : "Running locally"}
             </span>
             <button
               className="icon-button"
-              aria-label="開啟偏好設定"
+              aria-label="Open preferences"
               onClick={() => setShowSettings(true)}
             >
               <Settings2 size={18} />
@@ -950,12 +1048,12 @@ export default function App() {
             <div>
               <div className="eyebrow heading-eyebrow">
                 {view === "daily"
-                  ? "把零散片刻，整理成理解"
+                  ? "Turn scattered moments into understanding"
                   : view === "import"
-                    ? "從一段錄音開始"
+                    ? "Start with a recording"
                     : view === "memory"
-                      ? "每一份理解，都有來源"
-                      : "在合適的時候，給一點支持"}
+                      ? "Every understanding has a source"
+                      : "A little support, at the right time"}
               </div>
               <h1>
                 {viewNames[view]}
@@ -965,62 +1063,22 @@ export default function App() {
               </h1>
               <p>
                 {view === "daily"
-                  ? "回看心情、連結與值得記住的事。你可以確認，也可以修正。"
+                  ? "Look back on moods, connections and moments worth remembering. You can confirm or correct them."
                   : view === "import"
-                    ? "上傳原有錄音，完成英文轉寫，再確認屬於你的片段。"
+                    ? "Upload an existing recording, complete English transcription, then confirm which segments are yours."
                     : view === "memory"
-                      ? "查看記憶的原話和版本，讓它更貼近你的實際經歷。"
-                      : "只有符合前置條件，才會出現提醒、建議、安慰或預警。"}
+                      ? "See the original words and versions behind each memory, and bring it closer to what really happened."
+                      : "Reminders, suggestions or comfort appear only when their conditions are met."}
               </p>
             </div>
             <div className="heading-actions">
-              {view === "daily" && (
-                <button
-                  className="button secondary"
-                  disabled={
-                    !health?.analysis?.configured ||
-                    Boolean(busy) ||
-                    !currentCards.length
-                  }
-                  title={
-                    health?.analysis?.configured
-                      ? `使用 ${health.analysis.model || "已設定模型"} 整理目前卡片`
-                      : "可在 .env 設定本機或相容模型；目前為本機規則示例"
-                  }
-                  onClick={() =>
-                    void run(
-                      "generate",
-                      () =>
-                        api("/analysis/generate", {
-                          method: "POST",
-                          body: JSON.stringify({ date: selectedDate }),
-                        }),
-                      "模型已整理目前片段，來源仍可追溯與修正。",
-                    )
-                  }
-                >
-                  {busy === "generate" ? (
-                    <LoaderCircle className="spin" size={16} />
-                  ) : (
-                    <Sparkles size={16} />
-                  )}
-                  AI 整理
-                </button>
-              )}
-              <button
-                className="button secondary"
-                onClick={() => setShowDemo(true)}
-              >
-                <WandSparkles size={16} />
-                體驗演示
-              </button>
               {view !== "import" && (
                 <button
                   className="button primary"
                   onClick={() => setView("import")}
                 >
                   <Plus size={18} />
-                  匯入錄音
+                  Import recording
                 </button>
               )}
             </div>
@@ -1029,11 +1087,11 @@ export default function App() {
             <div className="alert alert-error" role="alert">
               <span>{error}</span>
               <button className="text-button" onClick={() => void refresh()}>
-                重試 <RefreshCw size={15} />
+                Retry <RefreshCw size={15} />
               </button>
               <button
                 className="icon-button"
-                aria-label="關閉錯誤訊息"
+                aria-label="Dismiss error"
                 onClick={() => setError("")}
               >
                 <X size={16} />
@@ -1046,7 +1104,7 @@ export default function App() {
               <span>{notice}</span>
               <button
                 className="icon-button"
-                aria-label="關閉通知"
+                aria-label="Dismiss notification"
                 onClick={() => setNotice("")}
               >
                 <X size={16} />
@@ -1056,7 +1114,7 @@ export default function App() {
           {loading && !state ? (
             <div className="loading-state" role="status">
               <LoaderCircle className="spin" size={30} />
-              <p>正在整理你的空間…</p>
+              <p>Preparing your space…</p>
             </div>
           ) : (
             <>
@@ -1065,7 +1123,7 @@ export default function App() {
                   <div className="date-selector">
                     <button
                       className="icon-button"
-                      aria-label="前一日"
+                      aria-label="Previous day"
                       onClick={() => {
                         const next = new Date(`${selectedDate}T12:00:00+08:00`);
                         next.setUTCDate(next.getUTCDate() - 1);
@@ -1077,7 +1135,7 @@ export default function App() {
                     <label>
                       <CalendarDays size={17} />
                       <input
-                        aria-label="選擇卡片日期"
+                        aria-label="Choose Uploading date"
                         type="date"
                         value={selectedDate}
                         onChange={(event) => setDate(event.target.value)}
@@ -1085,7 +1143,7 @@ export default function App() {
                     </label>
                     <button
                       className="icon-button"
-                      aria-label="後一日"
+                      aria-label="Next day"
                       onClick={() => {
                         const next = new Date(`${selectedDate}T12:00:00+08:00`);
                         next.setUTCDate(next.getUTCDate() + 1);
@@ -1096,9 +1154,9 @@ export default function App() {
                     </button>
                   </div>
                   <span className="date-description">
-                    {niceDate(selectedDate)}
+                    Uploading date · {niceDate(selectedDate)}
                     {selectedDate === localDate() && (
-                      <span className="tag">今天</span>
+                      <span className="tag">Today</span>
                     )}
                   </span>
                   <button
@@ -1107,7 +1165,7 @@ export default function App() {
                     onClick={() => void refresh(date, true)}
                   >
                     <RefreshCw size={14} />
-                    重新整理
+                    Refresh
                   </button>
                 </div>
               )}
@@ -1117,22 +1175,22 @@ export default function App() {
                     <div className="banner-copy">
                       <span className="banner-label">
                         <Sprout size={15} />
-                        給自己一點空間
+                        Give yourself some space
                       </span>
-                      <h2>你的一天，值得好好聽見。</h2>
+                      <h2>Your day deserves to be heard.</h2>
                       <p>
                         {currentCards.length
-                          ? "這些片刻來自你確認的本人片段。慢慢看，請核實每張卡片是否理解正確。"
-                          : "不必記住每一句話。匯入錄音，讓重要的心情與連結慢慢浮現。"}
+                          ? "These summaries keep their original sources. Edit a topic or atomic memory whenever needed."
+                          : "You don't need to remember every word. Import a recording and let the moments that matter surface gently."}
                       </p>
                       <div className="banner-status">
                         <span>
                           <AudioLines size={14} />
-                          {recordings.length} 段錄音
+                          {recordings.length} recordings
                         </span>
                         <span>
                           <CheckCircle2 size={14} />
-                          {activeMemories.length} 則有效記憶
+                          {activeMemories.length} active memories
                         </span>
                       </div>
                     </div>
@@ -1145,62 +1203,50 @@ export default function App() {
                       <div className="art-stem" />
                       <div className="art-spark spark-one">✦</div>
                       <div className="art-spark spark-two">✧</div>
-                      <div className="art-caption">留意 · 理解 · 成長</div>
+                      <div className="art-caption">Notice · Understand · Grow</div>
                     </div>
                   </section>
                   {pending.length > 0 && (
                     <div className="pending-banner">
                       <MessageCircle size={19} />
                       <div>
-                        <strong>{pending.length} 段錄音等待你確認</strong>
+                        <strong>{pending.length} recording{pending.length === 1 ? "" : "s"} awaiting your confirmation</strong>
                         <span>
-                          轉寫已完成。確認哪些片段是你說的，才會用來整理卡片。
+                          Transcription finished. Confirm which segments are yours so they can be used in cards.
                         </span>
                       </div>
                       <button
                         className="text-button"
                         onClick={() => openRecording(pending[0])}
                       >
-                        查看片段 <ArrowRight size={16} />
-                      </button>
-                    </div>
-                  )}
-                  {Number(state?.coverage?.undated_memories || 0) > 0 && (
-                    <div className="pending-banner">
-                      <CalendarDays size={18} />
-                      <div>
-                        <strong>
-                          {String(state?.coverage?.undated_memories)}{" "}
-                          則記憶沒有錄音發生時間
-                        </strong>
-                        <span>未歸入特定日期，仍可在記憶與來源頁查看。</span>
-                      </div>
-                      <button
-                        className="text-button"
-                        onClick={() => setView("memory")}
-                      >
-                        查看記憶 <ArrowRight size={15} />
+                        View segments <ArrowRight size={16} />
                       </button>
                     </div>
                   )}
                   <section>
                     <div className="section-heading">
                       <h2>
-                        每日片刻
+                        Daily moments
                         <span className="section-count">
                           {currentCards.length.toString().padStart(2, "0")}
                         </span>
                       </h2>
-                      <span>只涵蓋已匯入片段 · 可修正</span>
+                      <span>Only covers imported segments · Editable</span>
                     </div>
+                    {showSummaryStatus && <div className="assessment summary-status" role={summaryStatus.canRetry ? "alert" : "status"}>
+                      {summaryStatus.polling ? <LoaderCircle className="spin" size={18} /> : <FileAudio size={18} />}
+                      <div><strong>{summaryStatus.label}</strong><p>{summaryStatus.message}</p></div>
+                      {summaryStatus.canRetry && <button className="small-button" disabled={Boolean(busy)} onClick={() => void run("retry-summary", () => api("/analysis/generate", { method: "POST", body: JSON.stringify({ date: selectedDate }) }), "Daily summaries updated.")}>{busy === "retry-summary" ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}Retry summary</button>}
+                    </div>}
                     {currentCards.length ? (
                       <div className="daily-grid">
                         {currentCards.map((card) => (
                           <DailyCard
                             key={card.id}
                             card={card}
+                            generation={state?.summary_generation}
                             open={() => openCard(card)}
-                            confirm={() => void confirmCard(card)}
+                            edit={() => editCardTopic(card)}
                             busy={Boolean(busy)}
                           />
                         ))}
@@ -1221,17 +1267,17 @@ export default function App() {
                                 <h3>{categoryLabels[category]}</h3>
                                 <p>
                                   {category === "mood"
-                                    ? "留意你如何描述自己的感受"
+                                    ? "Notice how you describe your feelings"
                                     : category === "social"
-                                      ? "記下日常中的對話與連結"
-                                      : "保留對你重要的事與承諾"}
+                                      ? "Capture everyday conversations and connections"
+                                      : "Keep the things and promises that matter to you"}
                                 </p>
                                 <div className="placeholder-lines">
                                   <i />
                                   <i />
                                 </div>
                                 <span className="placeholder-note">
-                                  匯入並確認錄音後開始整理
+                                  Import and confirm a recording to get started
                                 </span>
                               </div>
                             );
@@ -1245,13 +1291,13 @@ export default function App() {
                       <div className="section-heading">
                         <h2>
                           <Sparkles size={19} />
-                          此刻的關懷
+                          Care right now
                         </h2>
                         <button
                           className="text-button"
                           onClick={() => setView("care")}
                         >
-                          查看全部 <ArrowRight size={15} />
+                          View all <ArrowRight size={15} />
                         </button>
                       </div>
                       {careCards.length ? (
@@ -1260,6 +1306,7 @@ export default function App() {
                           feedback={feedback}
                           open={() => openCard(careCards[0])}
                           memories={memories}
+                          recordings={recordings}
                           openMemory={(id) => void openMemory(id)}
                           schedule={scheduleBedtime}
                           busy={Boolean(busy)}
@@ -1270,10 +1317,10 @@ export default function App() {
                             <Heart size={23} />
                           </span>
                           <div>
-                            <h3>暫時沒有需要打擾你的事</h3>
+                            <h3>Nothing needs to interrupt you right now</h3>
                             <p>
                               {state?.assessment?.reason ||
-                                "條件符合時，關懷才會出現在這裏。"}
+                                "Care appears here only when its conditions are met."}
                             </p>
                           </div>
                         </div>
@@ -1281,31 +1328,31 @@ export default function App() {
                     </div>
                     <div className="how-card">
                       <div className="section-heading">
-                        <h2>從錄音，到理解</h2>
+                        <h2>From recording to understanding</h2>
                         <Layers3 size={18} />
                       </div>
                       <div className="mini-flow">
                         <span>
                           <FileAudio size={17} />
-                          <small>原話</small>
+                          <small>Words</small>
                         </span>
                         <ArrowRight size={14} />
                         <span>
                           <Database size={17} />
-                          <small>記憶</small>
+                          <small>Memory</small>
                         </span>
                         <ArrowRight size={14} />
                         <span>
                           <Heart size={17} />
-                          <small>卡片</small>
+                          <small>Card</small>
                         </span>
                       </div>
-                      <p>每張卡片都能查看來源。修正一處，相關理解亦會更新。</p>
+                      <p>Every card shows its sources. Correct one detail and related understanding updates too.</p>
                       <button
                         className="text-button"
                         onClick={() => setView("memory")}
                       >
-                        管理我的記憶 <ArrowRight size={15} />
+                        Manage my memories <ArrowRight size={15} />
                       </button>
                     </div>
                   </section>
@@ -1331,11 +1378,11 @@ export default function App() {
                       <span className="upload-symbol">
                         <UploadCloud size={32} />
                       </span>
-                      <h2>{file ? file.name : "把錄音帶進你的空間"}</h2>
+                      <h2>{file ? file.name : "Bring a recording into your space"}</h2>
                       <p>
                         {file
-                          ? `${(file.size / 1024 / 1024).toFixed(1)} MB · 準備匯入`
-                          : "拖放檔案到這裏，或選擇電腦中的錄音"}
+                          ? `${(file.size / 1024 / 1024).toFixed(1)} MB · Ready to import`
+                          : "Drop a file here, or choose a recording from your computer"}
                       </p>
                       <input
                         ref={inputRef}
@@ -1353,30 +1400,53 @@ export default function App() {
                         onClick={() => inputRef.current?.click()}
                       >
                         <Plus size={16} />
-                        {file ? "重新選擇" : "選擇錄音檔"}
+                        {file ? "Choose another" : "Choose a recording"}
                       </button>
                       <small>
-                        MP3、WAV、M4A、FLAC、OGG、WebM · 最多 100 MB／20 分鐘
+                        MP3, WAV, M4A, FLAC, OGG, WebM · Up to {maxUploadMb} MB / 20 minutes
+                        {(Number(asr?.required_channels) === 1 || Boolean(asr?.mono_only)) && " · Mono audio required"}
                       </small>
                     </div>
+                    {hosted && (
+                      <p className="small-text muted">
+                        Recordings are uploaded to and stored on this demo server.
+                        Others with demo access can view them; users do not have
+                        separate private workspaces.
+                      </p>
+                    )}
+                    {externalAsr && (
+                      <p className="small-text muted">
+                        Audio is sent to {asrProvider} for transcription{asr?.speaker_diarization ? " and anonymous speaker separation" : ""}.
+                        Speaker labels do not identify you; you confirm your own segments.
+                      </p>
+                    )}
+                    {asr && !externalAsr && (
+                      <p className="small-text muted">
+                        Audio is processed {hosted ? "on this demo server" : "on this device"}.
+                        {asr.speaker_diarization
+                          ? " Anonymous labels distinguish voices within this recording; you confirm which segments are yours."
+                          : " Automatic speaker separation is not enabled; speakers stay unknown until you confirm your segments."}
+                      </p>
+                    )}
+                    {asr?.provider === "sensevoice" && (
+                      <p className="small-text muted">
+                        Playback times follow estimated speech and speaker segments. Word timestamps are not available.
+                      </p>
+                    )}
+                    {memoryPipeline?.mode === "deepseek" && (
+                      <p className="small-text muted">
+                        {memoryTransferNotice(memoryPipeline.provider)}{" "}
+                        Processing starts automatically; speaker identity and your support preferences remain separate.
+                      </p>
+                    )}
                     <div className="upload-options">
-                      <label>
-                        錄音發生時間 <span>選填 · 香港時間</span>
-                        <input
-                          type="datetime-local"
-                          value={recordedAt}
-                          onChange={(event) =>
-                            setRecordedAt(event.target.value)
-                          }
-                        />
-                      </label>
                       <div>
-                        <span className="field-label">轉錄語言</span>
+                        <span className="field-label">Transcription language</span>
                         <div className="language-field">
-                          English <span className="tag">英文優先</span>
+                          English <span className="tag">English first</span>
                         </div>
                         <small>
-                          未提供時間時會標示「錄音時間未知」，不會以匯入時間代替。
+                          Uploading date is assigned by the server when the file is uploaded · Hong Kong (UTC+8).
                         </small>
                       </div>
                       <button
@@ -1389,15 +1459,15 @@ export default function App() {
                         ) : (
                           <ArrowDownToLine size={17} />
                         )}{" "}
-                        {busy === "upload" ? "正在匯入…" : "匯入並轉寫"}
+                        {busy === "upload" ? "Uploading…" : "Upload and process"}
                       </button>
                     </div>
                   </form>
                   <div className="process-explainer">
                     {[
-                      ["1", "本機英文轉寫", "Whisper large-v3-turbo"],
-                      ["2", "確認你的片段", "保留未知說話者"],
-                      ["3", "整理記憶與卡片", "每則理解保留來源"],
+                      ["1", externalAsr ? "Cloud English transcription" : hosted ? "Server-side English transcription" : "Local English transcription", `${asrProvider} · ${asrModel}`],
+                      ["2", "Atomic memories", "Extracted automatically with source links"],
+                      ["3", "Topics", "Related atomic memories are organized automatically"],
                     ].map(([n, title, text]) => (
                       <div key={n}>
                         <span>{n}</span>
@@ -1411,7 +1481,7 @@ export default function App() {
                   <section>
                     <div className="section-heading">
                       <h2>
-                        錄音紀錄
+                        Recordings
                         <span className="section-count">
                           {recordings.length}
                         </span>
@@ -1427,17 +1497,11 @@ export default function App() {
                             </span>
                             <div className="recording-info">
                               <h3>{recording.filename}</h3>
-                              <p>
-                                {shortDate(recording.recorded_at)}
-                                {recording.is_demo && (
-                                  <span className="tag tag-demo">
-                                    虛構演示 · 沒有音訊檔
-                                  </span>
-                                )}
-                              </p>
+                              <p>{uploadingDateLabel(recording)}</p>
                               {recording.error && (
-                                <p className="error-text">{recording.error}</p>
+                                <p className="error-text">{englishMessage(recording.error)}</p>
                               )}
+                              <PipelineProgress pipeline={recording.memory_pipeline} recording={recording} />
                             </div>
                             <span
                               className={`status-pill status-${recording.status}`}
@@ -1467,25 +1531,36 @@ export default function App() {
                                           `/recordings/${recording.id}/retry`,
                                           { method: "POST" },
                                         ),
-                                      "已重新安排轉寫。",
+                                      "Transcription has been re-queued.",
                                     )
                                   }
                                 >
                                   <RefreshCw size={14} />
-                                  重試
+                                  Retry
                                 </button>
                               )}
                               {Boolean(recording.segments?.length) && (
-                                <button
-                                  className="small-button"
-                                  onClick={() => openRecording(recording)}
-                                >
-                                  查看逐字稿
-                                </button>
+                                <>
+                                  {(recording.memory_pipeline?.status === "failed" || recording.topic_pipeline?.status === "failed") && <button
+                                    className="small-button"
+                                    disabled={Boolean(busy) || !memoryPipeline?.configured || ["pending", "processing"].includes(recording.memory_pipeline?.status || "")}
+                                    title={memoryPipeline?.configured ? "Process transcript with DeepSeek" : "Configure DeepSeek on the server first"}
+                                    onClick={() => void understandRecording(recording)}
+                                  >
+                                    <Sparkles size={14} />
+                                    Retry automatic processing
+                                  </button>}
+                                  <button
+                                    className="small-button"
+                                    onClick={() => openRecording(recording)}
+                                  >
+                                    View transcript
+                                  </button>
+                                </>
                               )}
                               <button
                                 className="icon-button"
-                                aria-label={`刪除錄音 ${recording.filename}`}
+                                aria-label={`Delete recording ${recording.filename}`}
                                 onClick={() => deleteRecording(recording)}
                               >
                                 <Trash2 size={16} />
@@ -1498,206 +1573,47 @@ export default function App() {
                       <div className="panel">
                         <Empty
                           icon={<FileAudio size={26} />}
-                          title="這裏會保存你的錄音紀錄"
+                          title="Your recordings will be kept here"
                         >
-                          選擇一段錄音後，處理狀態與逐字稿會顯示在這裏。
+                          Choose a recording and its processing status and transcript will appear here.
                         </Empty>
                       </div>
                     )}
                   </section>
                 </>
               )}
-              {view === "memory" && (
-                <>
-                  <div className="memory-layers" aria-label="五層記憶架構">
-                    {[
-                      ["01", "原始證據", FileAudio],
-                      ["02", "原子記憶", Database],
-                      ["03", "記憶整合", Layers3],
-                      ["04", "檢索上下文", Search],
-                      ["05", "治理", ShieldCheck],
-                    ].map(([n, label, Icon]) => {
-                      const LayerIcon = Icon as typeof FileAudio;
-                      return (
-                        <div key={String(n)}>
-                          <span>{String(n)}</span>
-                          <LayerIcon size={19} />
-                          <strong>{String(label)}</strong>
-                        </div>
-                      );
-                    })}
+              {view === "memory" && <>
+                <p className="ai-section-description">Atomic memories are organized by topic. Edit a topic and its memories together; original source words stay unchanged.</p>
+                <div className="memory-toolbar">
+                  <label className="search-field"><Search size={17} /><input placeholder="Search atomic memory content" aria-label="Search atomic memories" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+                  <select aria-label="Filter atomic memories" value={filter} onChange={(event) => setFilter(event.target.value)}>
+                    <option value="all">All atomic memories</option><option value="mood">Mood &amp; feelings</option><option value="social">Social &amp; connection</option><option value="moments">Memorable moments</option><option value="pending">Speaker unconfirmed</option>
+                  </select><span className="result-count">{filteredMemories.length} atomic memories</span>
+                </div>
+                {atomicSections.length ? <div className="atomic-topic-list">{atomicSections.map((section) => <section className="atomic-topic-card" key={`${section.recording.id}-${section.topic?.id || "pending"}`}>
+                  <div className="atomic-topic-heading"><div><h2>{section.number ? `${section.number}. ` : ""}{section.title}</h2><p>{section.recording.filename}</p><p>{uploadingDateLabel(section.recording)}</p></div>
+                    <div className="atomic-topic-actions">{section.topic && <button className="small-button" disabled={Boolean(busy)} onClick={() => openTopicEditor(section.recording, section.topic!)}>Edit topic</button>}<button className="text-button" onClick={() => openRecording(section.recording)}>Original sources <ArrowRight size={14} /></button></div>
                   </div>
-                  <div className="memory-toolbar">
-                    <label className="search-field">
-                      <Search size={17} />
-                      <input
-                        placeholder="搜尋記憶內容或情境"
-                        aria-label="搜尋記憶"
-                        value={query}
-                        onChange={(event) => setQuery(event.target.value)}
-                      />
-                      {query && (
-                        <button
-                          className="icon-button"
-                          aria-label="清除搜尋"
-                          onClick={() => setQuery("")}
-                        >
-                          <X size={15} />
-                        </button>
-                      )}
-                    </label>
-                    <select
-                      aria-label="篩選記憶"
-                      value={filter}
-                      onChange={(event) => setFilter(event.target.value)}
-                    >
-                      <option value="all">全部記憶</option>
-                      <option value="mood">心情與感受</option>
-                      <option value="social">社交與連結</option>
-                      <option value="moments">重要片刻</option>
-                      <option value="pending">等待主體確認</option>
-                      <option value="review_pending">理解待核實</option>
-                    </select>
-                    <span className="result-count">
-                      {filteredMemories.length} 則記憶
-                    </span>
-                  </div>
-                  {filteredMemories.length ? (
-                    <div className="memory-list">
-                      {filteredMemories.map((memory) => {
-                        const Icon = categoryIcons[memory.category] || Database;
-                        return (
-                          <article className="memory-row" key={memory.id}>
-                            <span
-                              className={`category-icon category-${memory.category}`}
-                            >
-                              <Icon size={20} />
-                            </span>
-                            <div>
-                              <div className="memory-row-meta">
-                                <span>{categoryLabels[memory.category]}</span>
-                                <span>v{memory.version}</span>
-                                <span>
-                                  {memory.confirmed
-                                    ? "主體已確認"
-                                    : "主體待確認"}
-                                </span>
-                                <span>
-                                  {memory.reviewed
-                                    ? "理解已核實"
-                                    : "理解待核實"}
-                                </span>
-                                {memory.is_demo && (
-                                  <span className="tag tag-demo">虛構演示</span>
-                                )}
-                              </div>
-                              <h3>{memory.content}</h3>
-                              <p>
-                                {memory.event_time
-                                  ? shortDate(memory.event_time)
-                                  : "錄音時間未知"}{" "}
-                                ·{" "}
-                                {memory.subject_id === "user"
-                                  ? "屬於你"
-                                  : "說話者未知"}{" "}
-                                ·{" "}
-                                {memory.memory_type === "semantic"
-                                  ? "偏好／語義記憶"
-                                  : "事件記憶"}
-                              </p>
-                            </div>
-                            <button
-                              className="text-button"
-                              onClick={() => void openMemory(memory.id)}
-                            >
-                              來源與修正 <ArrowRight size={16} />
-                            </button>
-                          </article>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="panel">
-                      <Empty
-                        icon={<Database size={27} />}
-                        title={
-                          query || filter !== "all"
-                            ? "沒有符合的記憶"
-                            : "記憶會在確認原話後開始累積"
-                        }
-                      >
-                        {query || filter !== "all"
-                          ? "試試其他關鍵字，或查看全部記憶。"
-                          : "先匯入錄音，或載入有清楚標示的虛構演示。"}
-                        {!query && filter === "all" && (
-                          <>
-                            <br />
-                            原始證據、原子記憶、整合、檢索與治理，均可從這裏查看。
-                          </>
-                        )}
-                      </Empty>
-                    </div>
-                  )}
-                </>
-              )}
+                  {section.summary && <p className="atomic-topic-summary">{section.summary}</p>}
+                  {!section.topic && <p className="source-help">Topic organization runs automatically. These atomic memories remain visible while it completes.</p>}
+                  <div className="memory-list">{section.memories.map((memory, index) => <article className="memory-row" key={memory.id}>
+                    <span className="atomic-memory-number">{section.number ? `${section.number}.${(section.topic?.memory_ids.indexOf(memory.id) ?? index) + 1}` : index + 1}</span>
+                    <div><div className="memory-row-meta"><span>{categoryLabels[memory.category]}</span><span>v{memory.version}</span><span>{memory.subject_id === "user" && memory.confirmed ? "Your speaker identity confirmed" : "Speaker unconfirmed"}</span></div><h3>{memory.content}</h3></div>
+                    <button className="text-button" onClick={() => void openMemory(memory.id)}>Sources <ArrowRight size={15} /></button>
+                  </article>)}</div>
+                </section>)}</div> : <div className="panel"><Empty icon={<Database size={27} />} title={query || filter !== "all" ? "No matching atomic memories" : "Atomic memories appear automatically after upload"}>{query || filter !== "all" ? "Try another search or filter." : "Upload a recording. Transcribing, atomic memory extraction and topic organization run automatically."}</Empty></div>}
+              </>}
               {view === "care" && (
                 <>
-                  <div className="section-heading ai-section-heading">
-                    <h2>
-                      <MessageCircle size={19} />
-                      一、主動核實理解
-                    </h2>
-                    <span>本人片段不等於理解已核實</span>
-                  </div>
-                  <p className="ai-section-description">
-                    我先整理，再請你核實。只有你確認的理解，才會用於主動支持。
-                  </p>
-                  {currentCards.some(
-                    (card) => card.review_status !== "confirmed",
-                  ) ? (
-                    <div className="daily-grid review-grid">
-                      {currentCards
-                        .filter((card) => card.review_status !== "confirmed")
-                        .map((card) => (
-                          <DailyCard
-                            key={card.id}
-                            card={card}
-                            open={() => openCard(card)}
-                            confirm={() => void confirmCard(card)}
-                            busy={Boolean(busy)}
-                          />
-                        ))}
-                    </div>
-                  ) : (
-                    <div className="quiet-card review-empty">
-                      <span>
-                        <CheckCircle2 size={23} />
-                      </span>
-                      <div>
-                        <h3>
-                          {currentCards.length
-                            ? "本日卡片的理解已核實"
-                            : "暫時沒有待核實卡片"}
-                        </h3>
-                        <p>新摘要或來源改動後，會再次詢問你是否理解正確。</p>
-                      </div>
-                    </div>
-                  )}
-                  <div className="section-heading ai-section-heading">
-                    <h2>
-                      <Sparkles size={19} />
-                      二、主動支持
-                    </h2>
-                    <span>已核實的歷史與當前記憶</span>
-                  </div>
+                  <div className="section-heading ai-section-heading"><h2><Sparkles size={19} />Proactive support</h2><span>Preferences and conditions apply automatically</span></div>
                   <div className="care-intro">
                     <span className="care-intro-icon">
                       <Heart size={26} />
                     </span>
                     <div>
-                      <h2>支持有依據，也尊重你的節奏。</h2>
+                      <h2>Support with evidence, at your pace.</h2>
                       <p>
-                        連結已核實的過往與當前記憶，依照偏好及前置條件提供支持。條件不明時，保持安靜。
+                        Support updates automatically from your memories, confirmed speaker identity, preferences and conditions. When conditions are unclear, stay quiet.
                       </p>
                     </div>
                     <button
@@ -1710,7 +1626,7 @@ export default function App() {
                               method: "POST",
                               body: JSON.stringify({ date: selectedDate }),
                             }),
-                          "已重新檢查當前條件。",
+                          "Current conditions re-checked.",
                         )
                       }
                       disabled={Boolean(busy)}
@@ -1720,54 +1636,56 @@ export default function App() {
                       ) : (
                         <RefreshCw size={16} />
                       )}
-                      檢查條件
+                      Refresh conditions
                     </button>
                   </div>
                   <div className="condition-grid">
                     {(
-                      [
-                        "reminder",
-                        "suggestion",
-                        "comfort",
-                        "warning",
-                      ] as CareType[]
-                    ).map((type) => (
+                      ["reminder", "suggestion", "comfort", "warning"] as CareType[]
+                    ).map((type) => {
+                      const condition = careConditionDisplay(type, state?.assessment, state?.settings?.preferences);
+                      const timing = state?.assessment.types?.[type]?.display_time;
+                      const timeLabels = supportTimeLabels(timing);
+                      return (
                       <div
-                        className={`condition-tile ${selectedCareType.includes(type) ? "matched" : ""}`}
+                        className={`condition-tile ${condition.matched ? "matched" : ""}`}
                         key={type}
                       >
                         <div>
                           <strong>{careLabels[type]}</strong>
-                          <span>
-                            {selectedCareType.includes(type)
-                              ? "符合條件"
-                              : state?.settings?.preferences?.[type] === false
-                                ? "已關閉"
-                                : "未觸發"}
-                          </span>
+                          <span>{condition.badge}</span>
                         </div>
-                        <p>
-                          {type === "reminder"
-                            ? "已核實、允許跟進，且到期未完成的事項。應用開啟時檢查。"
-                            : type === "suggestion"
-                              ? "清楚的需要、可行的行動，以及接收建議的意願。"
-                              : type === "comfort"
-                                ? "已確認的感受或支持需要，當下適合給予安慰。"
-                                : "只用明確虛構情境示範；需在偏好中單獨啟用。"}
-                        </p>
+                        <p className="condition-diagnostic" aria-label={`${careLabels[type]} assessment`}>{condition.reason}</p>
+                        {condition.deliveryReason && condition.deliveryReason !== condition.reason && <p className="condition-delivery" aria-label={`${careLabels[type]} delivery`}><strong>Delivery:</strong> {condition.deliveryReason}</p>}
+                        <details className="condition-requirement"><summary>Support requirements</summary><p>{condition.requirement}</p></details>
+                        <dl className="support-display-times">
+                          <dt>Scheduled display (not before)</dt><dd>{timeLabels.scheduled}</dd>
+                          <dt>Earliest automatic display</dt><dd>{timeLabels.next}</dd>
+                          <dt>Last displayed</dt><dd>{timeLabels.displayed}</dd>
+                        </dl>
+                        {timeLabels.reason !== condition.reason && timeLabels.reason !== condition.deliveryReason && <p className="support-time-reason">{timeLabels.reason}</p>}
+                        <div className="support-display-actions">
+                          <button className="small-button ghost" disabled={Boolean(busy) || !timing} onClick={() => openDisplayTimeEditor(type)} aria-label={`Edit display time for ${careLabels[type]}`}>Edit display time</button>
+                          <button className="small-button" disabled={Boolean(busy) || !condition.canRequestSupport} onClick={() => void requestSupport(type)} aria-label={`Display Proactive Support Now: ${careLabels[type]}`}>{busy === `display-now-${type}` && <LoaderCircle className="spin" size={14} />}{busy === `display-now-${type}` ? "Preparing support…" : "Display Proactive Support Now"}</button>
+                        </div>
                       </div>
-                    ))}
+                    );})}
                   </div>
                   <div className="assessment">
                     <ShieldCheck size={18} />
                     <div>
-                      <strong>本次條件檢查</strong>
+                      <strong>This condition check</strong>
                       <p>
                         {state?.assessment?.reason ||
-                          "尚未有可評估的有效記憶。"}
+                          "No valid memories to evaluate yet."}
                       </p>
+                      <p>Automatic support also checks quiet mode, timing and frequency. Display Now requests one eligible card without changing your saved schedule or preferences.</p>
                     </div>
                   </div>
+                  {state?.care_generation && ["pending", "failed", "unconfigured"].includes(state.care_generation.status) && <div className="assessment" role={state.care_generation.status === "failed" ? "alert" : "status"}>
+                    {state.care_generation.status === "pending" ? <LoaderCircle className="spin" size={18} /> : <Heart size={18} />}
+                    <div><strong>{state.care_generation.status === "pending" ? "Preparing support" : "Support unavailable"}</strong><p>{state.care_generation.message}</p></div>
+                  </div>}
                   {careCards.length ? (
                     <div className="care-grid">
                       {careCards.map((card) => (
@@ -1777,6 +1695,7 @@ export default function App() {
                           feedback={feedback}
                           open={() => openCard(card)}
                           memories={memories}
+                          recordings={recordings}
                           openMemory={(id) => void openMemory(id)}
                           schedule={scheduleBedtime}
                           busy={Boolean(busy)}
@@ -1787,9 +1706,9 @@ export default function App() {
                     <div className="panel">
                       <Empty
                         icon={<Heart size={27} />}
-                        title="此刻，讓你保留安靜的空間"
+                        title={careEmpty.title}
                       >
-                        沒有符合條件的提示會保持不輸出。多類同時符合而選擇規則未定，也不會顯示卡片。
+                        {careEmpty.message}
                       </Empty>
                     </div>
                   )}
@@ -1798,128 +1717,38 @@ export default function App() {
               <footer className="page-footer">
                 <span>
                   <ShieldCheck size={13} />
-                  來源可追溯，理解可修正
+                  Traceable sources, correctable understanding
                 </span>
                 <span>
-                  分析模式：
+                  Analysis mode:{" "}
                   {health?.analysis?.mode === "llm"
-                    ? "已設定模型分析"
-                    : "本機規則示例"}{" "}
-                  · 不作臨床診斷
+                    ? "Configured model analysis"
+                    : health?.memory_pipeline?.mode === "deepseek" ? "DeepSeek setup required" : "Local rule-based demo"}{" "}
+                  · No clinical diagnosis
                 </span>
                 <a
                   href="https://github.com/kenlacroix/moodhaven-journal"
                   target="_blank"
                   rel="noreferrer"
                 >
-                  介面元件：MoodHaven · MIT
+                  UI components: MoodHaven · MIT
                 </a>
               </footer>
             </>
           )}
         </div>
       </main>
-      {showDemo && (
-        <Modal title="體驗虛構演示" close={closeDemo}>
-          <div className="modal-body">
-            {error && (
-              <div className="alert alert-error" role="alert">
-                {error}
-              </div>
-            )}
-            <p className="modal-description">
-              使用固定英語範例，體驗卡片、來源修正及不同觸發條件。這些是虛構資料，沒有假裝存在的錄音檔。
-            </p>
-            <button
-              className="button primary full-width"
-              disabled={Boolean(busy)}
-              onClick={() =>
-                void run(
-                  "demo-seed",
-                  async () => {
-                    await api("/demo/seed", { method: "POST" });
-                    setDate("");
-                    setView("daily");
-                    setShowDemo(false);
-                  },
-                  "已載入虛構演示。你可以點卡片查看及修正來源。",
-                )
-              }
-            >
-              <WandSparkles size={17} />
-              {busy === "demo-seed" ? "正在載入…" : "載入每日卡片演示"}
-            </button>
-            <div className="modal-divider" />
-            <h3 className="small-heading">選擇主動式 AI 情境</h3>
-            <p className="muted small-text">
-              每次只切換演示資料，不會更改你的真實記憶。預警須先在偏好中啟用。
-            </p>
-            <div className="scenario-grid">
-              {(
-                [
-                  "reminder",
-                  "suggestion",
-                  "comfort",
-                  "warning",
-                  "none",
-                  "multiple",
-                  "sleep",
-                  "social_history",
-                  "emotional_history",
-                ] as const
-              ).map((type) => (
-                <button
-                  className="scenario-button"
-                  key={type}
-                  disabled={Boolean(busy)}
-                  onClick={() =>
-                    void run(
-                      `scenario-${type}`,
-                      async () => {
-                        await api("/demo/scenario", {
-                          method: "POST",
-                          body: JSON.stringify({ type }),
-                        });
-                        setDate("");
-                        setView("care");
-                        setShowDemo(false);
-                      },
-                      "已切換虛構演示情境。",
-                    )
-                  }
-                >
-                  <span>
-                    {type === "none"
-                      ? "零類符合"
-                      : type === "multiple"
-                        ? "多類符合"
-                        : type === "sleep"
-                          ? "跨日睡眠"
-                          : type === "social_history"
-                            ? "社交狀況跟進"
-                            : type === "emotional_history"
-                              ? "情緒狀況跟進"
-                              : careLabels[type]}
-                  </span>
-                  <small>
-                    {type === "none" || type === "multiple"
-                      ? "驗證不輸出"
-                      : type === "warning"
-                        ? "需單獨啟用"
-                        : type === "sleep"
-                          ? "七天內三日記錄"
-                          : type === "social_history" ||
-                              type === "emotional_history"
-                            ? "過往與今天的出處"
-                            : "單類觸發演示"}
-                  </small>
-                  <ArrowRight size={15} />
-                </button>
-              ))}
-            </div>
-          </div>
-        </Modal>
-      )}
+      {displayTimeEditor && <Modal title={`Edit display time · ${careLabels[displayTimeEditor.type]}`} close={closeDisplayTimeEditor} className="display-time-modal">
+        <form className="modal-body" onSubmit={saveDisplayTime}>
+          <p className="modal-description">Choose a one-time earliest display time in Hong Kong (UTC+8). Source conditions, preferences and automatic delivery checks still apply while the app is open.</p>
+          <label className="display-time-choice"><input type="radio" name="display-time-mode" checked={displayTimeEditor.automatic} disabled={Boolean(busy)} onChange={() => setDisplayTimeEditor((previous) => previous ? { ...previous, automatic: true, error: previous.conflict ? previous.error : "" } : previous)} />Automatic timing</label>
+          <label className="display-time-choice"><input type="radio" name="display-time-mode" checked={!displayTimeEditor.automatic} disabled={Boolean(busy)} onChange={() => setDisplayTimeEditor((previous) => previous ? { ...previous, automatic: false, error: previous.conflict ? previous.error : "" } : previous)} />Set one display time</label>
+          {!displayTimeEditor.automatic && <label className="field-label" htmlFor="support-display-time">Hong Kong date and time (UTC+8)<input id="support-display-time" type="datetime-local" required value={displayTimeEditor.value} disabled={Boolean(busy)} onChange={(event) => setDisplayTimeEditor((previous) => previous ? { ...previous, value: event.target.value, error: previous.conflict ? previous.error : "" } : previous)} /></label>}
+          {displayTimeEditor.notice && <p className="topic-refresh-notice" role="status">{displayTimeEditor.notice}</p>}
+          {displayTimeEditor.error && <div className="date-editor-error" role="alert"><p>{displayTimeEditor.error}</p>{displayTimeEditor.conflict && <button type="button" className="small-button" disabled={Boolean(busy)} onClick={() => void refreshDisplayTimeDraft()}><RefreshCw size={14} />Refresh saved time; keep my draft</button>}</div>}
+          <div className="date-editor-actions"><button type="button" className="button secondary" disabled={Boolean(busy)} onClick={closeDisplayTimeEditor}>Cancel</button><button type="submit" className="button primary" disabled={Boolean(busy) || displayTimeEditor.conflict || (!displayTimeEditor.automatic && !displayTimeEditor.value)}>{busy === "save-display-time" ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}Save display time</button></div>
+        </form>
+      </Modal>}
       {showSettings && state && (
         <Preferences
           error={error}
@@ -1935,14 +1764,34 @@ export default function App() {
                   method: "PATCH",
                   body: JSON.stringify(patch),
                 }),
-              "偏好已更新，待展示提示亦已重新檢查。",
+              "Preferences updated; pending suggestions were re-checked.",
             )
           }
         />
       )}
-      {drawerVisible && (
+      {topicEditor && <Modal title={`Edit topic ${topicEditor.number}`} close={closeTopicEditor} className="topic-edit-modal">
+        <form className="modal-body topic-edit-form" onSubmit={saveTopic}>
+          <p className="modal-description">{topicEditor.recordingName}<br />Edit the topic and its atomic memories. Original audio, transcript fragments, speaker identity and support permissions stay unchanged.</p>
+          <label htmlFor="topic-edit-title" className="field-label">Topic title</label>
+          <input id="topic-edit-title" type="text" maxLength={120} value={topicEditor.title} disabled={Boolean(busy)} onChange={(event) => setTopicEditor((previous) => previous ? { ...previous, title: event.target.value, error: previous.conflict ? previous.error : "" } : previous)} />
+          <label htmlFor="topic-edit-summary" className="field-label">Topic summary</label>
+          <textarea id="topic-edit-summary" rows={3} maxLength={2000} value={topicEditor.summary} disabled={Boolean(busy)} onChange={(event) => setTopicEditor((previous) => previous ? { ...previous, summary: event.target.value, error: previous.conflict ? previous.error : "" } : previous)} />
+          {topicEditor.notice && <div className="topic-refresh-notice" role="status"><p>{topicEditor.notice}</p><details><summary>Latest saved topic text</summary><strong>{topicEditor.savedTitle}</strong><p>{topicEditor.savedSummary}</p></details></div>}
+          <h3 className="small-heading">Atomic memories</h3>
+          {!topicEditor.memories.length && <p className="source-help">No atomic memories are linked to this topic yet. You can still edit its title and summary.</p>}
+          {topicEditor.memories.map((memory, index) => <div className="topic-memory-field" key={memory.id}>
+            <label className="field-label" htmlFor={`topic-memory-${index}`}>{topicEditor.number}.{index + 1} · Atomic memory · v{memory.version}</label>
+            <textarea id={`topic-memory-${index}`} rows={3} maxLength={4000} value={memory.content} disabled={Boolean(busy)} onChange={(event) => setTopicEditor((previous) => previous ? { ...previous, memories: previous.memories.map((item) => item.id === memory.id ? { ...item, content: event.target.value } : item), error: previous.conflict ? previous.error : "" } : previous)} />
+            {memory.unavailable && <p className="error-text">This atomic memory is unavailable. Your draft is preserved; copy it before closing.</p>}
+            {topicEditor.notice && <details className="topic-saved-memory"><summary>Latest saved atomic memory</summary><p>{memory.savedContent}</p></details>}
+          </div>)}
+          {topicEditor.error && <div className="date-editor-error" role="alert"><p>{topicEditor.error}</p>{topicEditor.conflict && <button type="button" className="small-button" disabled={Boolean(busy)} onClick={() => void refreshTopicDraft()}><RefreshCw size={14} />Refresh saved values; keep my draft</button>}</div>}
+          <div className="date-editor-actions"><button type="button" className="button secondary" disabled={Boolean(busy)} onClick={closeTopicEditor}>Cancel</button><button type="submit" className="button primary" disabled={Boolean(busy) || topicEditor.conflict || !topicDraftChanged(topicEditor) || topicEditor.memories.some((memory) => memory.unavailable)}>{busy === "save-topic" ? <LoaderCircle size={15} className="spin" /> : <Check size={15} />}Save changes</button></div>
+        </form>
+      </Modal>}
+      {drawerVisible && !topicEditor && (
         <Modal
-          title={source ? "記憶與原話" : "錄音逐字稿"}
+          title={source ? "Memory & original words" : "Recording transcript"}
           close={closeDrawer}
           className="source-drawer"
         >
@@ -1950,7 +1799,7 @@ export default function App() {
             {sourceLoading ? (
               <div className="loading-state">
                 <LoaderCircle className="spin" size={24} />
-                <p>正在讀取來源…</p>
+                <p>Loading sources…</p>
               </div>
             ) : (
               <>
@@ -1965,23 +1814,24 @@ export default function App() {
                       <span className="tag">
                         {categoryLabels[source.memory.category]}
                       </span>
-                      <span>記憶 v{source.memory.version}</span>
-                      {source.memory.is_demo && (
-                        <span className="tag tag-demo">虛構演示</span>
-                      )}
+                      <span>Memory v{source.memory.version}</span>
                     </div>
                     <h3>{source.memory.content}</h3>
                     <div className="evidence-label">
                       <ShieldCheck size={14} />
                       {source.memory.confirmed
-                        ? "主體已確認"
-                        : "等待主體確認"}{" "}
-                      · {source.memory.reviewed ? "理解已核實" : "理解待核實"} ·{" "}
+                        ? "Speaker confirmed"
+                        : "Awaiting speaker confirmation"}{" "}
+                      ·{" "}
                       {source.memory.evidence_kind === "ai_inference"
-                        ? "系統推測"
+                        ? "System inference"
                         : source.memory.evidence_kind === "user_confirmed"
-                          ? "用戶補充／修正"
-                          : "原話表達"}
+                          ? "User addition / correction"
+                          : "Original statement"}
+                    </div>
+                    <div className="source-topic-actions">
+                      {sourceTopic && activeRecording && <button className="small-button" disabled={Boolean(busy)} onClick={() => openTopicEditor(activeRecording, sourceTopic)}>Edit topic {sourceTopic.number}</button>}
+                      <button className="text-button danger-text" disabled={Boolean(busy)} onClick={() => deleteMemory(source.memory)}>Delete atomic memory</button>
                     </div>
                   </div>
                 )}
@@ -1990,31 +1840,34 @@ export default function App() {
                     <div className="source-section-title">
                       <h3>
                         <FileAudio size={17} />
-                        原始錄音
+                        Original recording
                       </h3>
                       <span>{activeRecording.filename}</span>
                     </div>
-                    {activeRecording.is_demo ? (
-                      <div className="demo-audio">
-                        <AudioLines size={22} />
-                        <div>
-                          <strong>虛構逐字稿</strong>
-                          <p>此演示沒有音訊檔，故不提供錄音回放。</p>
-                        </div>
-                      </div>
-                    ) : (
-                      <audio
-                        ref={audioRef}
-                        controls
-                        preload="metadata"
-                        src={`/api/recordings/${activeRecording.id}/audio`}
-                        onError={() =>
-                          setSourceError(
-                            "暫時未能讀取錄音。檔案可能已移除，請重新整理來源。",
-                          )
-                        }
-                        aria-label="原始錄音播放"
-                      />
+                    <p className="source-help">{uploadingDateLabel(activeRecording)}</p>
+                    <audio
+                      ref={audioRef}
+                      controls
+                      preload="metadata"
+                      src={`/api/recordings/${activeRecording.id}/audio`}
+                      onError={() =>
+                        setSourceError(
+                          "The recording could not be loaded. The file may have been removed; refresh the sources.",
+                        )
+                      }
+                      aria-label="Original recording playback"
+                    />
+                    <PipelineProgress pipeline={activeRecording.memory_pipeline} recording={activeRecording} />
+                    {Boolean(activeRecording.segments?.length) && (activeRecording.memory_pipeline?.status === "failed" || activeRecording.topic_pipeline?.status === "failed") && (
+                      <button
+                        className="small-button"
+                        disabled={Boolean(busy) || !memoryPipeline?.configured || ["pending", "processing"].includes(activeRecording.memory_pipeline?.status || "")}
+                        title={memoryPipeline?.configured ? "Process transcript with DeepSeek" : "Configure DeepSeek on the server first"}
+                        onClick={() => void understandRecording(activeRecording)}
+                      >
+                        <Sparkles size={14} />
+                        Retry automatic processing
+                      </button>
                     )}
                   </section>
                 )}
@@ -2023,202 +1876,140 @@ export default function App() {
                     <div className="source-section-title">
                       <h3>
                         <MessageCircle size={17} />
-                        逐字稿片段
+                        {transcriptView.kind === "topics" ? "Transcript by topic" : "Original source turns"}
                       </h3>
-                      <span>原話保留英文</span>
+                      <span>Original words preserved</span>
                     </div>
-                    {(!source || requiresSubjectConfirmation) && (
-                      <p className="source-help">
-                        請勾選確定是你說的片段。未確認的說話者不會自動當作你。
-                      </p>
-                    )}
-                    <div className="transcript-list">
-                      {segments.map((segment, index) => {
-                        const id =
-                          segment.id || segment.segment_id || String(index);
-                        const confirmed =
-                          segment.subject_id === "user" ||
-                          segment.speaker === "user";
+                    <p className="source-help">{transcriptView.reason}</p>
+                    {selectableSegmentIds.length > 0 ? (
+                      <>
+                        <p className="source-help" id="transcript-selection-help">
+                          Select only the original fragments that are definitely yours. Anonymous speaker labels do not identify you.
+                          Selecting a topic or all fragments does not confirm anything; review other voices and unknown speech before continuing.
+                        </p>
+                        <div className="transcript-selection-bar">
+                          <SelectionCheckbox label="Select all" checked={effectiveSelection.length === selectableSegmentIds.length}
+                            indeterminate={effectiveSelection.length > 0 && effectiveSelection.length < selectableSegmentIds.length}
+                            disabled={transcriptBusy}
+                            onChange={(checked) => setSelectedSegments((previous) => toggleIds(previous, selectableSegmentIds, checked, selectableSegmentIds))} />
+                          <span role="status" aria-live="polite">{effectiveSelection.length} of {selectableSegmentIds.length} pending fragments selected</span>
+                          <button className="text-button" disabled={transcriptBusy || !effectiveSelection.length}
+                            onClick={() => setSelectedSegments([])}>Clear selection</button>
+                        </div>
+                      </>
+                    ) : <p className="source-help">No unconfirmed fragments are available to select. Speaker identity remains separate from topic edits and support preferences.</p>}
+                    <div className="transcript-topics">
+                      {transcriptView.groups.map((group, groupIndex) => {
+                        const pendingIds = pendingSegmentIds(group.segments);
+                        const count = pendingIds.filter((id) => effectiveSelection.includes(id)).length;
                         return (
-                          <div className="transcript-segment" key={id}>
-                            {(!source || requiresSubjectConfirmation) && (
-                              <input
-                                aria-label={`確認第 ${index + 1} 段屬於我`}
-                                type="checkbox"
-                                checked={selectedSegments.includes(id)}
-                                onChange={(event) =>
-                                  setSelectedSegments((previous) =>
-                                    event.target.checked
-                                      ? [...previous, id]
-                                      : previous.filter(
-                                          (value) => value !== id,
-                                        ),
-                                  )
-                                }
-                              />
-                            )}
-                            <div>
-                              <div className="segment-meta">
-                                <button
-                                  className="time-button"
-                                  disabled={activeRecording?.is_demo}
-                                  onClick={() => {
-                                    if (audioRef.current) {
-                                      audioRef.current.currentTime =
-                                        segment.start;
-                                      void audioRef.current
-                                        .play()
-                                        .catch(() =>
-                                          setSourceError(
-                                            "請使用錄音播放器的播放按鈕開始回放。",
-                                          ),
-                                        );
-                                    }
-                                  }}
-                                  aria-label={`從 ${timeLabel(segment.start)} 回放`}
-                                >
-                                  {!activeRecording?.is_demo && (
-                                    <Play size={11} />
-                                  )}{" "}
-                                  {timeLabel(segment.start)} —{" "}
-                                  {timeLabel(segment.end)}
-                                </button>
-                                <span>
-                                  {confirmed ? "已確認屬於你" : "說話者未知"}
-                                </span>
-                              </div>
-                              <p lang="en">{segment.text}</p>
+                          <article className="transcript-topic" key={`${activeRecording?.id}-${group.id}`}>
+                            <div className="topic-heading">
+                              <h4>{transcriptView.kind === "topics" ? `${group.number || groupIndex + 1}. ` : ""}{group.title}</h4>
+                              <span className="topic-kind">{group.topic?.edited ? "Edited topic" : transcriptView.kind === "topics" ? "Topic" : "Source turn · no AI grouping"}</span>
+                              {group.topic && activeRecording && <button className="small-button" disabled={Boolean(busy)} onClick={() => openTopicEditor(activeRecording, group.topic!)}>Edit topic</button>}
                             </div>
-                          </div>
+                            <div className="topic-speakers">
+                              <Users size={13} aria-hidden="true" />
+                              {group.speakerLabels.map((label) => label === "unknown" ? "Speaker unknown" : anonymousSpeakerLabel(label)).join(" · ")}
+                            </div>
+                            {group.mixedSpeakers && <p className="topic-warning">Multiple speakers in this topic. Selecting the whole topic includes different voices; select only your own fragments below.</p>}
+                            {group.hasUnknownSpeaker && <p className="topic-warning">Some speech has an unknown or overlapping speaker. Review the audio and leave uncertain fragments unselected.</p>}
+                            {pendingIds.length > 0 && <div className="topic-selection">
+                              <SelectionCheckbox label={transcriptView.kind === "topics" ? "Select topic" : "Select turn"}
+                                ariaLabel={`Select all pending fragments in ${transcriptView.kind === "topics" ? "topic" : "source turn"} ${groupIndex + 1}: ${group.title}`}
+                                checked={count === pendingIds.length} indeterminate={count > 0 && count < pendingIds.length}
+                                disabled={transcriptBusy}
+                                onChange={(checked) => setSelectedSegments((previous) => toggleIds(previous, pendingIds, checked, selectableSegmentIds))} />
+                              <span>{count}/{pendingIds.length} pending selected</span>
+                            </div>}
+                            {group.summary && <div className="topic-summary">
+                              <strong>Topic summary</strong>
+                              <p>{group.summary}</p>
+                            </div>}
+                            <div className="topic-original">
+                              <strong>Original words</strong>
+                              {group.segments.map((segment, index) => <p key={`${getSegmentId(segment) || "source"}-${index}`} lang="en">{segment.text}</p>)}
+                            </div>
+                            <details className="topic-fragments">
+                              <summary>Review {group.segments.length} original fragment{group.segments.length === 1 ? "" : "s"} · playback, speakers & selection</summary>
+                              <div className="transcript-list">
+                                {group.segments.map((segment, index) => {
+                                  const id = getSegmentId(segment);
+                                  const confirmed = isIdentityConfirmed(segment);
+                                  const mine = segment.subject_id === "user" || segment.speaker === "user";
+                                  return (
+                                    <div className="transcript-segment" key={`${id || "source"}-${index}`}>
+                                      <input type="checkbox" aria-label={`Select fragment at ${timeLabel(segment.start)}: ${segment.text}`}
+                                        checked={Boolean(id && effectiveSelection.includes(id))}
+                                        disabled={transcriptBusy || confirmed || !id}
+                                        onChange={(event) => id && setSelectedSegments((previous) => toggleIds(previous, [id], event.target.checked, selectableSegmentIds))} />
+                                      <div>
+                                        <div className="segment-meta">
+                                          <button className="time-button" disabled={Boolean(busy)}
+                                            onClick={() => {
+                                              if (audioRef.current) {
+                                                audioRef.current.currentTime = segment.start;
+                                                void audioRef.current.play().catch(() => setSourceError("Use the recording player's play button to start playback."));
+                                              }
+                                            }} aria-label={`Play from ${timeLabel(segment.start)}`}>
+                                            <Play size={11} /> {timeLabel(segment.start)} — {timeLabel(segment.end)}
+                                          </button>
+                                          <span>{anonymousSpeakerLabel(segment.speaker_label) && `${anonymousSpeakerLabel(segment.speaker_label)} · `}
+                                            {confirmed ? mine ? "Confirmed as yours" : "Identity already confirmed" : !id ? "Source ID unavailable" : anonymousSpeakerLabel(segment.speaker_label) ? "Identity unconfirmed" : "Speaker unknown"}</span>
+                                        </div>
+                                        <p lang="en">{segment.text}</p>
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </details>
+                          </article>
                         );
                       })}
                     </div>
-                    {(!source || requiresSubjectConfirmation) && (
+                    {selectableSegmentIds.length > 0 && (
+                      <>
                       <button
                         className="button primary full-width"
-                        disabled={!selectedSegments.length || Boolean(busy)}
+                        disabled={!effectiveSelection.length || transcriptBusy}
+                        aria-describedby="transcript-selection-help"
                         onClick={() => void confirmSegments()}
                       >
                         <CheckCircle2 size={17} />
-                        確認 {selectedSegments.length} 個片段屬於我
+                        Confirm {effectiveSelection.length} segment{effectiveSelection.length === 1 ? "" : "s"} as mine
                       </button>
+                      <p className="source-help confirmation-help">This confirms who spoke. It does not change your support preferences or the original source words.</p>
+                      </>
                     )}
                   </section>
                 )}
                 {source && (
-                  <form className="source-section" onSubmit={saveMemory}>
-                    <div className="source-section-title">
-                      <h3>
-                        <Settings2 size={17} />
-                        修正理解
-                      </h3>
-                      <span>原始逐字稿保持獨立</span>
-                    </div>
-                    <label className="field-label" htmlFor="memory-edit">
-                      這段經歷，應該怎樣理解？
-                    </label>
-                    <textarea
-                      id="memory-edit"
-                      value={edit}
-                      onChange={(event) => setEdit(event.target.value)}
-                      rows={4}
-                      maxLength={4000}
-                    />
-                    <label className="checkbox-line">
-                      <input
-                        type="checkbox"
-                        checked={allowFollowup}
-                        onChange={(event) =>
-                          setAllowFollowup(event.target.checked)
-                        }
-                      />
-                      允許對這則記憶建立到期提醒
-                    </label>
-                    {allowFollowup && (
-                      <label className="followup-field">
-                        跟進時間（香港）
-                        <input
-                          type="datetime-local"
-                          value={dueAt}
-                          onChange={(event) => setDueAt(event.target.value)}
-                          required
-                        />
-                      </label>
-                    )}
-                    <p className="small-text muted">
-                      {requiresSubjectConfirmation
-                        ? "請先在上方確認哪些片段屬於你，再修正記憶。"
-                        : "儲存表示你核實這則記憶的理解。會建立新版本，重算卡片，並取消不適用的提示；新摘要仍會再次請你核實。"}
-                    </p>
-                    {conflict && (
-                      <div className="conflict-message">
-                        <p>
-                          你的修改仍然保留。請先複製需要保留的內容，再載入最新版本。
-                        </p>
-                        <button
-                          type="button"
-                          className="small-button"
-                          onClick={() => void openMemory(source.memory.id)}
-                        >
-                          <RefreshCw size={14} />
-                          捨棄編輯並載入最新版本
-                        </button>
-                      </div>
-                    )}
-                    <div className="editor-actions">
-                      <button
-                        className="button primary"
-                        type="submit"
-                        disabled={
-                          !edit.trim() ||
-                          Boolean(busy) ||
-                          conflict ||
-                          requiresSubjectConfirmation
-                        }
-                      >
-                        {busy === "save-memory" ? (
-                          <LoaderCircle size={16} className="spin" />
-                        ) : (
-                          <Check size={16} />
-                        )}
-                        確認並儲存
-                      </button>
-                      <button
-                        className="text-button danger-text"
-                        type="button"
-                        onClick={() => deleteMemory(source.memory)}
-                      >
-                        <Trash2 size={15} />
-                        刪除記憶
-                      </button>
-                    </div>
-                  </form>
-                )}
-                {source && (
                   <section className="source-section">
-                    <h3 className="small-heading">記憶資料與版本</h3>
+                    <h3 className="small-heading">Memory details and versions</h3>
                     <div className="metadata-grid">
                       <span>
-                        主體
+                        Speaker
                         <strong>
                           {source.memory.subject_id === "user"
-                            ? "你（已確認）"
-                            : "未知"}
+                            ? "You (confirmed)"
+                            : "Unknown"}
                         </strong>
                       </span>
                       <span>
-                        範圍
+                        Scope
                         <strong>
                           {scopeLabels[source.memory.scope] ||
-                            (source.memory.scope ? "錄音情境" : "未指定")}
+                            (source.memory.scope ? "Recording context" : "Unspecified")}
                         </strong>
                       </span>
                       <span>
-                        事件時間
-                        <strong>{shortDate(source.memory.event_time)}</strong>
+                        Uploading date
+                        <strong>{uploadingDateLabel(activeRecording)}</strong>
                       </span>
                       <span>
-                        狀態
+                        Status
                         <strong>
                           {statusNames[source.memory.status] ||
                             source.memory.status}
@@ -2233,8 +2024,8 @@ export default function App() {
                             <p>{version.content}</p>
                             <small>
                               {version.version === source.memory.version
-                                ? "目前版本"
-                                : "已取代"}
+                                ? "Current version"
+                                : "Superseded"}
                             </small>
                           </div>
                         ))}
@@ -2248,7 +2039,7 @@ export default function App() {
                     onClick={() => deleteRecording(activeRecording)}
                   >
                     <Trash2 size={15} />
-                    刪除整段錄音及相關記憶
+                    Delete the whole recording and related memories
                   </button>
                 )}
               </>
@@ -2257,9 +2048,9 @@ export default function App() {
           <div className="drawer-foot">
             <button className="text-button" onClick={closeDrawer}>
               <ArrowLeft size={15} />
-              返回{viewNames[view]}
+              Back to {viewNames[view]}
             </button>
-            <span>保留原日期與頁面</span>
+            <span>Keeps Uploading date and page</span>
           </div>
         </Modal>
       )}
@@ -2281,7 +2072,7 @@ export default function App() {
             <p>{danger.description}</p>
             <div className="modal-actions">
               <button className="button secondary" onClick={closeDanger}>
-                取消
+                Cancel
               </button>
               <button
                 className="button danger-button"
@@ -2293,11 +2084,11 @@ export default function App() {
                       await danger.run();
                       setDanger(null);
                     },
-                    "已刪除，相關理解已更新。",
+                    "Deleted; related understanding updated.",
                   )
                 }
               >
-                {busy === "delete" ? "正在刪除…" : "確認刪除"}
+                {busy === "delete" ? "Deleting…" : "Delete permanently"}
               </button>
             </div>
           </div>
@@ -2323,8 +2114,11 @@ function Preferences({
   save: (patch: Partial<Settings>) => void;
 }) {
   const status = health?.asr || {};
+  const externalAsr = Boolean(status.external);
+  const hosted = health?.deployment?.mode === "server";
+  const pipeline = health?.memory_pipeline;
   return (
-    <Modal title="偏好與模型" close={close}>
+    <Modal title="Preferences & model" close={close}>
       <div className="modal-body">
         {error && (
           <div className="alert alert-error" role="alert">
@@ -2332,7 +2126,7 @@ function Preferences({
           </div>
         )}
         <p className="modal-description">
-          選擇你希望收到的支持。偏好更改會套用到待展示的提示。
+          Choose the support you would like to receive. Changes apply to pending suggestions.
         </p>
         <div className="preference-list">
           {(["reminder", "suggestion", "comfort", "warning"] as CareType[]).map(
@@ -2341,27 +2135,23 @@ function Preferences({
                 <span>
                   <strong>{careLabels[type]}</strong>
                   <small>
-                    {type === "warning"
-                      ? "僅虛構預警演示，不作疾病或風險判斷"
-                      : type === "reminder"
-                        ? "只跟進已確認並允許提醒的事項"
-                        : type === "suggestion"
-                          ? "在清楚有需要時，提供可行的小步驟"
-                          : "在你表達需要時，給一點支持"}
+                    {type === "reminder"
+                      ? "Follow up only on items you allowed reminders for"
+                      : type === "suggestion"
+                        ? "Offer a small workable step when a need is clear"
+                        : type === "comfort"
+                          ? "Offer a little support when you say you need it"
+                          : "Offer a supportive check-in when your confirmed words show strong distress or repeated emotional or social strain"}
                   </small>
                 </span>
                 <input
                   type="checkbox"
                   role="switch"
+                  aria-label={careLabels[type]}
                   disabled={busy}
-                  checked={Boolean(settings.preferences?.[type])}
+                  checked={supportPreferenceEnabled(settings, type)}
                   onChange={(event) =>
-                    save({
-                      preferences: {
-                        ...settings.preferences,
-                        [type]: event.target.checked,
-                      },
-                    })
+                    save(supportPreferencePatch(settings, type, event.target.checked))
                   }
                 />
               </label>
@@ -2370,8 +2160,8 @@ function Preferences({
         </div>
         <label className="preference-row">
           <span>
-            <strong>免打擾</strong>
-            <small>開啟時保持安靜，暫停所有主動提示</small>
+            <strong>Quiet mode</strong>
+            <small>Stay quiet and pause all proactive suggestions</small>
           </span>
           <input
             type="checkbox"
@@ -2381,24 +2171,9 @@ function Preferences({
             onChange={(event) => save({ quiet_mode: event.target.checked })}
           />
         </label>
-        <label className="preference-row">
-          <span>
-            <strong>允許虛構預警演示</strong>
-            <small>須與「預警」同時開啟；真實錄音不產生臨床預警</small>
-          </span>
-          <input
-            type="checkbox"
-            role="switch"
-            disabled={busy}
-            checked={Boolean(settings.warning_demo_enabled)}
-            onChange={(event) =>
-              save({ warning_demo_enabled: event.target.checked })
-            }
-          />
-        </label>
         <div className="preferences-fields">
           <label>
-            提示最短間隔（分鐘）
+            Minimum interval between suggestions (minutes)
             <input
               type="number"
               min="0"
@@ -2413,7 +2188,7 @@ function Preferences({
             />
           </label>
           <label>
-            保留期限（天）
+            Retention period (days)
             <input
               type="number"
               min="1"
@@ -2431,32 +2206,73 @@ function Preferences({
         <div className="model-panel">
           <div className="note-line">
             <AudioLines size={17} />
-            <strong>本機轉錄模型</strong>
-            <span className="tag">開源</span>
+            <strong>Transcription service</strong>
+            <span className="tag">{externalAsr ? "Cloud API" : hosted ? "This server" : "This device"}</span>
           </div>
-          <p>Whisper large-v3-turbo · faster-whisper</p>
+          <p>
+            {transcriptionProviderLabel(status.provider)}
+            {" · "}{String(status.model || health?.model || "Configured by the backend")}
+          </p>
           <dl>
             <div>
-              <dt>狀態</dt>
+              <dt>Status</dt>
               <dd>
-                {status.loaded
-                  ? "已載入"
+                {transcriptionStageNames[String(status.state || "")] || (status.loaded
+                  ? externalAsr ? "Credentials configured" : "Loaded"
                   : status.available
-                    ? "首次使用時載入"
-                    : String(status.status || status.state || "等待設定")}
+                    ? externalAsr ? "Credentials configured" : ["qwen", "sensevoice"].includes(String(status.provider)) ? "Loads on demand" : "Loads on first use"
+                    : String(status.status || status.state || "Waiting for setup"))}
               </dd>
             </div>
             <div>
-              <dt>運行裝置</dt>
-              <dd>{String(status.device || "由後端選擇")}</dd>
+              <dt>Processing</dt>
+              <dd>{externalAsr ? "External cloud service" : `${hosted ? "This demo server" : "This device"} · ${String(status.device || "Backend-selected hardware")}`}</dd>
             </div>
             <div>
-              <dt>分析模式</dt>
-              <dd>本機規則示例</dd>
+              <dt>Speaker separation</dt>
+              <dd>{status.speaker_diarization ? status.available ? "Anonymous labels; identity needs confirmation" : "Configured; waiting for runtime and models" : "Not enabled; confirm each segment yourself"}</dd>
             </div>
+            {["qwen", "sensevoice"].includes(String(status.provider)) && (
+              <div>
+                <dt>{status.provider === "sensevoice" ? "Segment timing" : "Word timing"}</dt>
+                <dd>{status.provider === "sensevoice" ? "Speech/speaker estimates; no word timestamps" : "Estimated by Qwen3-ForcedAligner"}</dd>
+              </div>
+            )}
+          </dl>
+          {typeof status.error === "string" && status.error && (
+            <p className="error-text">{englishMessage(status.error)}</p>
+          )}
+          <small>
+            {externalAsr
+              ? "Audio is sent to the transcription provider. Configured credentials do not confirm a successful live request."
+              : ["qwen", "sensevoice"].includes(String(status.provider))
+                ? "Install the runtime and download the speech and speaker models first. Timing and speaker labels are estimates; overlapping or uncertain speech stays unknown. You confirm speaker identity separately."
+                : "The model may need to download on first use. You confirm who was speaking."}
+          </small>
+        </div>
+        <div className="model-panel">
+          <div className="note-line">
+            <Layers3 size={17} />
+            <strong>Memory understanding</strong>
+            <span className="tag">{pipeline?.mode === "deepseek" ? "DeepSeek" : "Local rules"}</span>
+          </div>
+          <dl>
+            <div>
+              <dt>Status</dt>
+              <dd>{pipeline?.mode === "deepseek" ? pipeline.configured ? "Credentials configured" : "Waiting for DeepSeek setup" : "Local rule-based demo"}</dd>
+            </div>
+            {pipeline?.mode === "deepseek" && (
+              <div>
+                <dt>Model</dt>
+                <dd>{pipeline.model || "Configured by the backend"}</dd>
+              </div>
+            )}
           </dl>
           <small>
-            首次使用可能需要下載模型。英文逐字稿可回看與修正；說話者身份由你確認。
+            {pipeline?.mode === "deepseek"
+              ? `Atomic memories, consolidation, context and governance use DeepSeek. ${memoryTransferNotice(pipeline.provider)} Live access must be verified by a completed request.`
+              : "Uses local rules to prepare tentative understanding."}
+            {" "}Speaker identity is confirmed separately. Topic edits do not grant permissions or change support preferences.
           </small>
         </div>
         <DatasetPanel />

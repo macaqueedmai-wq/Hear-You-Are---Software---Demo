@@ -1,0 +1,10 @@
+# Full application runtime with local Qwen ASR. Use an isolated Python 3.12 environment.
+# For NVIDIA, install torch from the official CUDA wheel index before this file.
+-r requirements.txt
+torch>=2.11,<3
+transformers>=5.13,<6
+accelerate>=1.10,<2
+librosa>=0.11,<1
+soundfile>=0.13,<1
+numpy>=2,<3
+sherpa-onnx==1.13.8

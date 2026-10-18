@@ -14,13 +14,20 @@ import re
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+from .transcript_groups import validate_transcript_groups
+from .topics import merge_topics, source_fingerprint, topic_view
+from .warning_signals import direct_distress_context, distress_topics, strong_distress
 
 HK = timezone(timedelta(hours=8))
 KINDS = ("reminder", "suggestion", "comfort", "warning")
 CATEGORIES = ("mood", "social", "moments")
+UNDATED_RECORDING_REASON = ("Some confirmed memories have no recording time. Set the recording time so they can appear "
+                            "in daily cards and be checked for proactive support.")
 DEFAULT_SETTINGS = {
     "preferences": {"reminder": True, "suggestion": True, "comfort": True, "warning": False},
     "quiet_mode": False,
@@ -72,7 +79,8 @@ def _uid() -> str:
 
 
 class Engine:
-    def __init__(self, data_dir: str | Path):
+    def __init__(self, data_dir: str | Path, model_mode: bool = False):
+        self.model_mode = model_mode
         self.data_dir = Path(data_dir).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.audio_dir = self.data_dir / "audio"
@@ -96,19 +104,30 @@ class Engine:
                     PRIMARY KEY(memory_id, version));
                 CREATE TABLE IF NOT EXISTS proactive (
                     id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS support_display_times (
+                    type TEXT PRIMARY KEY, display_at TEXT, revision INTEGER NOT NULL,
+                    fulfilled_revision INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS card_summaries (
                     date TEXT NOT NULL, category TEXT NOT NULL, payload TEXT NOT NULL,
                     PRIMARY KEY(date, category));
                 CREATE TABLE IF NOT EXISTS card_reviews (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS topic_versions (
+                    topic_id TEXT NOT NULL, version INTEGER NOT NULL, recording_id TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY(topic_id, version));
             """)
             db.execute("INSERT OR IGNORE INTO settings VALUES (1, ?)", (_dump(DEFAULT_SETTINGS),))
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.db_path, timeout=30)
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys=ON")
-        return db
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def _get(self, db: sqlite3.Connection, table: str, ident: str, *, deleted: bool = False) -> dict:
         row = db.execute(f"SELECT payload FROM {table} WHERE id=?", (ident,)).fetchone()
@@ -141,9 +160,67 @@ class Engine:
     def _settings(self, db: sqlite3.Connection) -> dict:
         return json.loads(db.execute("SELECT payload FROM settings WHERE id=1").fetchone()[0])
 
+    @staticmethod
+    def _display_time(value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if stamp.tzinfo is None or stamp.utcoffset() is None:
+                raise ValueError
+            return stamp.astimezone(HK).isoformat()
+        except (ValueError, TypeError, AttributeError, OverflowError) as error:
+            raise ValueError("Display time must be an ISO date and time with a timezone, or null.") from error
+
+    @staticmethod
+    def _display_schedule(db, kind):
+        row = db.execute("SELECT * FROM support_display_times WHERE type=?", (kind,)).fetchone()
+        return dict(row) if row else {"type": kind, "display_at": None, "revision": 0, "fulfilled_revision": 0}
+
+    def _schedule_pending(self, db, kind, now):
+        schedule = self._display_schedule(db, kind)
+        return bool(schedule["display_at"] and _time(schedule["display_at"]) <= now
+                    and schedule["fulfilled_revision"] != schedule["revision"])
+
+    def _schedule_block(self, db, kind, now):
+        stamp = self._display_schedule(db, kind)["display_at"]
+        return "The scheduled display time has not arrived." if stamp and _time(stamp) > now else None
+
+    def _fulfill_schedule(self, db, kind, now):
+        if self._schedule_pending(db, kind, now):
+            db.execute("UPDATE support_display_times SET fulfilled_revision=revision WHERE type=?", (kind,))
+
+    def update_display_time(self, kind: str, display_at: str | None, expected_display_at: str | None) -> dict:
+        if kind not in KINDS:
+            raise ValueError("Unknown proactive support type.")
+        stamp, expected = self._display_time(display_at), self._display_time(expected_display_at)
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            previous = self._display_schedule(db, kind)
+            if previous["display_at"] != expected:
+                raise VersionConflict("Display time changed. Refresh the saved time before editing again.")
+            if previous["display_at"] != stamp:
+                revision = previous["revision"] + 1
+                db.execute("INSERT INTO support_display_times VALUES (?,?,?,?) ON CONFLICT(type) DO UPDATE SET "
+                           "display_at=excluded.display_at,revision=excluded.revision,fulfilled_revision=excluded.fulfilled_revision",
+                           (kind, stamp, revision, 0 if stamp else revision))
+                # A new explicit time supersedes an earlier direct display. Keep
+                # safe generated wording dormant instead of faking a dismissal.
+                for card in self._all(db, "proactive"):
+                    if card["type"] == kind and card["status"] in {"active", "scheduled"}:
+                        receipt = self._automatic_receipt(card)
+                        if receipt:
+                            card["automatic_receipt_at"] = receipt.isoformat()
+                        card.update(status="scheduled", delivery_mode="scheduled" if stamp else "automatic",
+                                    display_schedule_revision=revision)
+                        self._save_proactive(db, card)
+                self._revalidate(db, _now())
+        return self.state()
+
     def create_recording(self, filename: str, file_path: str | Path | None, sha256: str,
-                         recorded_at: str | datetime | None, is_demo: bool = False) -> dict:
-        stamp = _time(recorded_at, nullable=True)
+                         recorded_at: str | datetime | None, is_demo: bool = False, *, _upload_time: bool = False) -> dict:
+        created = _now()
+        stamp = created if _upload_time else _time(recorded_at, nullable=True)
         if not str(sha256).strip():
             raise ValueError("錄音缺少檔案雜湊。")
         with self._lock, self._connect() as db:
@@ -153,28 +230,223 @@ class Engine:
             value = {
                 "id": _uid(), "filename": Path(filename).name, "file_path": str(file_path) if file_path else None,
                 "sha256": sha256, "recorded_at": stamp.isoformat() if stamp else None,
-                "created_at": _now().isoformat(), "status": "queued", "error": None,
+                "created_at": created.isoformat(), "status": "queued", "error": None,
                 "metrics": {}, "is_demo": bool(is_demo), "duplicate": False,
                 "language": "en", "extraction_mode": "local_rules", "has_audio": bool(file_path),
             }
             db.execute("INSERT INTO recordings VALUES (?,?,?)", (value["id"], sha256, _dump(value)))
             return value
 
+    def create_uploaded_recording(self, filename: str, file_path: str | Path | None,
+                                  sha256: str, is_demo: bool = False) -> dict:
+        """Use one persisted server upload timestamp for new HTTP recordings."""
+        return self.create_recording(filename, file_path, sha256, None, is_demo, _upload_time=True)
+
+    def _sources(self, db: sqlite3.Connection, recording_id: str) -> list[dict]:
+        return sorted([json.loads(row[0]) for row in db.execute(
+            "SELECT payload FROM segments WHERE recording_id=?", (recording_id,))], key=lambda source: source["start"])
+
+    def _save_topics(self, db, recording: dict, groups: list[dict], sources: list[dict]) -> None:
+        topics = merge_topics(recording, sources, groups, self._all(db, "memories"))
+        recording.update(topics=topics, topics_source_fingerprint=source_fingerprint(sources),
+                         topic_pipeline={"status": "completed", "stage": "completed", "error": None})
+        for topic in topics:
+            db.execute("INSERT OR IGNORE INTO topic_versions VALUES (?,?,?,?)",
+                       (topic["id"], topic["version"], recording["id"], _dump(topic)))
+
+    def _preserve_legacy_topics(self, db, recording: dict) -> None:
+        """Promote successful legacy groups before transient reports are cleared."""
+        report = recording.get("memory_pipeline", {})
+        if "topics" not in recording and report.get("status") == "completed" and report.get("transcript_groups"):
+            try:
+                self._save_topics(db, recording, report["transcript_groups"], self._sources(db, recording["id"]))
+                self._save_recording(db, recording)
+            except ValueError:
+                return
+
+    def update_topic_pipeline(self, recording_id: str, report: dict) -> None:
+        with self._lock, self._connect() as db:
+            recording = self._get(db, "recordings", recording_id)
+            recording["topic_pipeline"] = dict(report)
+            self._save_recording(db, recording)
+
+    def commit_topic_groups(self, recording_id: str, groups: list[dict], expected_revision: str,
+                            report: dict | None = None) -> dict:
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._agent_revision(db, recording_id) != expected_revision:
+                raise VersionConflict("Sources, topics or memories changed during topic organization; please retry.")
+            recording = self._get(db, "recordings", recording_id)
+            self._save_topics(db, recording, groups, self._sources(db, recording_id))
+            recording["topic_pipeline"] = {**(report or {}), "status": "completed", "stage": "completed"}
+            self._save_recording(db, recording)
+        return self.get_recording(recording_id)
+
+    def update_topic(self, recording_id: str, topic_id: str, version: int, title: str, summary: str,
+                     memories: list[dict] | None = None) -> dict:
+        if (type(version) is not int or version < 1 or not isinstance(title, str) or not title.strip()
+                or len(title) > 120 or not isinstance(summary, str) or not summary.strip() or len(summary) > 2000):
+            raise ValueError("Topic title, summary or version is invalid.")
+        if memories is not None and (not isinstance(memories, list) or len(memories) > 100):
+            raise ValueError("Topic corrections must contain at most 100 memory edits.")
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            recording = self._get(db, "recordings", recording_id)
+            self._preserve_legacy_topics(db, recording)
+            sources, rows = self._sources(db, recording_id), self._all(db, "memories")
+            topics = topic_view(recording, sources, rows)
+            topic = next((item for item in topics if item["id"] == topic_id), None)
+            if topic is None:
+                raise NotFoundError("The topic does not exist or its original sources changed.")
+            if topic["version"] != version:
+                raise VersionConflict("The topic changed; refresh it before saving again.")
+            allowed = {item["id"]: item for item in rows if item["id"] in topic["memory_ids"]}
+            edits, seen = [], set()
+            for raw in memories or []:
+                if (not isinstance(raw, dict) or set(raw) != {"id", "version", "content"}
+                        or not isinstance(raw["id"], str) or raw["id"] in seen
+                        or type(raw["version"]) is not int or raw["version"] < 1
+                        or not isinstance(raw["content"], str) or not raw["content"].strip() or len(raw["content"]) > 4000):
+                    raise ValueError("A topic memory correction has an invalid structure.")
+                memory = allowed.get(raw["id"])
+                if memory is None:
+                    raise ValueError("A corrected memory must belong to this topic's live original sources.")
+                if memory["version"] != raw["version"]:
+                    raise VersionConflict("A topic memory changed; refresh it before saving again.")
+                seen.add(raw["id"])
+                if raw["content"].strip() != memory["content"]:
+                    edits.append((memory, raw["content"].strip()))
+            title, summary = title.strip(), summary.strip()
+            if not edits and (title, summary) == (topic["title"], topic["summary"]):
+                return self.get_recording(recording_id)
+            # Validate every expected version before modifying any source-derived state.
+            for memory, content in edits:
+                replacement = {**memory, "content": content, "user_corrected": True,
+                               "reviewed": False, "reviewed_at": None, "follow_up": None}
+                replacement.pop("reviewed_via", None)
+                self._new_version(db, memory, replacement)
+            self._clear_agent_reports(db)
+            recording = self._get(db, "recordings", recording_id)
+            updated = {**topic, "title": title, "summary": summary, "version": topic["version"] + 1, "edited": True}
+            recording.update(topics=[updated if item["id"] == topic_id else item for item in topics],
+                             topics_source_fingerprint=source_fingerprint(sources))
+            db.execute("INSERT INTO topic_versions VALUES (?,?,?,?)",
+                       (topic_id, updated["version"], recording_id, _dump(updated)))
+            self._save_recording(db, recording)
+        return self.get_recording(recording_id)
+
+    def update_recording_time(self, recording_id: str, recorded_at: str | datetime | None,
+                              expected_recorded_at: str | datetime | None) -> dict:
+        """Correct source chronology without re-extracting or approving evidence.
+
+        The expected timestamp is a nullable compare-and-swap token. Equivalent
+        timezone representations are compared after normalization to Hong Kong.
+        A real change versions live memories and requires semantic review again.
+        """
+        def normalized(value):
+            try:
+                stamp = _time(value, nullable=True)
+                return stamp.isoformat() if stamp else None
+            except (ValueError, TypeError, OverflowError):
+                raise ValueError("Recording time must be a valid ISO date and time.") from None
+
+        replacement_time = normalized(recorded_at)
+        expected_time = normalized(expected_recorded_at)
+        with self._lock, self._connect() as db:
+            row = db.execute("SELECT payload FROM recordings WHERE id=?", (recording_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("找不到這項資料，或資料已刪除。")
+            recording = json.loads(row[0])
+            current_time = normalized(recording.get("recorded_at"))
+            if expected_time != current_time:
+                raise VersionConflict("Recording time changed; refresh the recording before saving again.")
+            if replacement_time == current_time:
+                return self.get_recording(recording_id)
+            recording.setdefault("recorded_at_history", []).append({
+                "previous_recorded_at": recording.get("recorded_at"), "recorded_at": replacement_time,
+                "changed_at": _now().isoformat(), "reason": "explicit_recording_time_correction"})
+            recording["recorded_at"] = replacement_time
+            # The payload predicate also protects against another Engine/process
+            # writing between this connection's read and its first write.
+            changed = db.execute("UPDATE recordings SET payload=? WHERE id=? AND payload=?",
+                                 (_dump(recording), recording_id, row[0]))
+            if changed.rowcount != 1:
+                raise VersionConflict("Recording time changed; refresh the recording before saving again.")
+            for memory in self._all(db, "memories"):
+                if memory["recording_id"] != recording_id or memory["status"] == "deleted":
+                    continue
+                replacement = {**memory, "event_time": replacement_time, "reviewed": False, "reviewed_at": None}
+                replacement.pop("reviewed_via", None)
+                self._new_version(db, memory, replacement)
+            # Date-wide summaries/reviews also depend on category membership:
+            # moving evidence changes both days, including an empty source set.
+            dates = {_time(value).date().isoformat() for value in (current_time, replacement_time) if value is not None}
+            for date in dates:
+                db.execute("DELETE FROM card_summaries WHERE date=?", (date,))
+                db.execute("DELETE FROM card_reviews WHERE id LIKE ?", (f"daily-{date}-%",))
+            # Even an empty extraction may have source groups or an active job.
+            # recorded_at is part of the in-flight pipeline revision token.
+            self._clear_agent_reports(db)
+        return self.get_recording(recording_id)
+
+    def align_upload_dates(self) -> dict:
+        """Explicit, idempotent migration to persisted server upload chronology.
+
+        Never called implicitly on import or HTTP reads. Retention created_at,
+        source evidence, identity, user corrections and deletion tombstones stay
+        intact. Every changed live memory receives a new historical version.
+        """
+        changed_recordings = changed_memories = unchanged = 0
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for item in self._all(db, "recordings"):
+                recording = self._get(db, "recordings", item["id"])
+                target = recording["created_at"]
+                _time(target)  # Reject malformed persisted chronology atomically.
+                if recording.get("recorded_at") == target:
+                    unchanged += 1
+                    continue
+                self._preserve_legacy_topics(db, recording)
+                previous = recording.get("recorded_at")
+                recording.setdefault("recorded_at_history", []).append({
+                    "previous_recorded_at": previous, "recorded_at": target,
+                    "changed_at": _now().isoformat(), "reason": "align_to_server_upload_date"})
+                recording["recorded_at"] = target
+                self._save_recording(db, recording)
+                for memory in self._all(db, "memories"):
+                    if memory["recording_id"] != recording["id"] or memory["status"] == "deleted":
+                        continue
+                    replacement = {**memory, "event_time": target, "reviewed": False, "reviewed_at": None}
+                    replacement.pop("reviewed_via", None)
+                    self._new_version(db, memory, replacement)
+                    changed_memories += 1
+                for date in {_time(value).date().isoformat() for value in (previous, target) if value is not None}:
+                    db.execute("DELETE FROM card_summaries WHERE date=?", (date,))
+                    db.execute("DELETE FROM card_reviews WHERE id LIKE ?", (f"daily-{date}-%",))
+                changed_recordings += 1
+            if changed_recordings:
+                self._clear_agent_reports(db)
+        return {"updated_recordings": changed_recordings, "updated_memories": changed_memories,
+                "unchanged_recordings": unchanged, "policy": "server_upload_date"}
+
     def get_recording(self, ident: str) -> dict:
-        with self._connect() as db:
+        with self._lock, self._connect() as db:
             value = self._get(db, "recordings", ident)
-            value["segments"] = [json.loads(row[0]) for row in db.execute("SELECT payload FROM segments WHERE recording_id=?", (ident,))]
-            value["segments"].sort(key=lambda s: s["start"])
+            self._preserve_legacy_topics(db, value)
+            value["segments"] = self._sources(db, ident)
+            value["topics"] = topic_view(value, value["segments"], self._all(db, "memories"))
             return value
 
     def list_recordings(self) -> list[dict]:
         with self._connect() as db:
             recordings = self._all(db, "recordings")
             for value in recordings:
+                self._preserve_legacy_topics(db, value)
                 rows = [json.loads(row[0]) for row in db.execute("SELECT payload FROM segments WHERE recording_id=?", (value["id"],))]
                 value["segment_count"] = len(rows)
                 value["confirmed_segment_count"] = sum(s["subject_id"] == "user" for s in rows)
                 value["segments"] = sorted(rows, key=lambda s: s["start"])
+                value["topics"] = topic_view(value, value["segments"], self._all(db, "memories"))
             return sorted(recordings, key=lambda r: r["created_at"], reverse=True)
 
     def set_recording_status(self, ident: str, status: str, error: str | None = None,
@@ -231,7 +503,7 @@ class Engine:
         return output
 
     def ingest_segments(self, recording_id: str, segments: list[dict], language: str = "en",
-                        subject_confirmed: bool = False) -> dict:
+                        subject_confirmed: bool = False, extract: bool = True) -> dict:
         if not isinstance(segments, list):
             raise ValueError("逐字稿片段格式不正確。")
         with self._lock, self._connect() as db:
@@ -251,18 +523,133 @@ class Engine:
                 segment = {
                     "id": _uid(), "recording_id": recording_id, "start": start, "end": end,
                     "text": text, "speaker": "user" if subject_confirmed else "unknown",
+                    "speaker_label": str(raw.get("speaker", "unknown"))[:100],
                     "subject_id": "user" if subject_confirmed else "unknown",
                     "confirmed": bool(subject_confirmed), "words": raw.get("words", []),
                     "fingerprint": fingerprint,
                 }
                 db.execute("INSERT INTO segments VALUES (?,?,?)", (segment["id"], recording_id, _dump(segment)))
-                self._extract_segment(db, recording, segment)
+                if extract:
+                    self._extract_segment(db, recording, segment)
                 existing.add(fingerprint)
                 added += 1
-            recording.update(status="ready", language=language, error=None)
+            recording.update(status="ready", language=language, error=None,
+                             extraction_mode="local_rules" if extract else "deepseek_pending")
+            if added and recording.get("topics_source_fingerprint") != source_fingerprint(self._sources(db, recording_id)):
+                recording["topics"] = []
+                recording.pop("topics_source_fingerprint", None)
             self._save_recording(db, recording)
+            if added and "transcript_groups" in recording.get("memory_pipeline", {}):
+                # A partition of the previous sources is no longer exhaustive.
+                self._clear_agent_reports(db)
         return {"recording": self.get_recording(recording_id), "added_segments": added,
-                "extraction_mode": "local_rules", "requires_confirmation": not subject_confirmed}
+                "extraction_mode": "local_rules" if extract else "deepseek_pending", "requires_confirmation": not subject_confirmed}
+
+    def update_pipeline(self, recording_id: str, pipeline: dict) -> None:
+        with self._lock, self._connect() as db:
+            recording = self._get(db, "recordings", recording_id)
+            # Progress/failure updates cannot publish unchecked source groups.
+            # Only the successful revision-checked commit below may store them.
+            recording["memory_pipeline"] = {key: value for key, value in pipeline.items()
+                                            if key != "transcript_groups"}
+            self._save_recording(db, recording)
+
+    def _agent_revision(self, db, recording_id: str) -> str:
+        recording = self._get(db, "recordings", recording_id)
+        segments = [json.loads(row[0]) for row in db.execute(
+            "SELECT payload FROM segments WHERE recording_id=? ORDER BY id", (recording_id,))]
+        # Card review changes semantic approval without bumping a memory version.
+        # Include the complete payload so that approval/permission races cancel.
+        memories = sorted(self._all(db, "memories"), key=lambda memory: memory["id"])
+        snapshot = {"recorded_at": recording.get("recorded_at"), "segments": segments,
+                    "topics": recording.get("topics", []), "topics_source_fingerprint": recording.get("topics_source_fingerprint"),
+                    "memories": memories, "settings": self._settings(db)}
+        return hashlib.sha256(_dump(snapshot).encode()).hexdigest()
+
+    def agent_snapshot(self, recording_id: str) -> dict:
+        with self._lock, self._connect() as db:
+            recording = self._get(db, "recordings", recording_id)
+            self._preserve_legacy_topics(db, recording)
+            segments = [json.loads(row[0]) for row in db.execute(
+                "SELECT payload FROM segments WHERE recording_id=?", (recording_id,))]
+            return {"recording": recording, "segments": sorted(segments, key=lambda s: s["start"]),
+                    "memories": [m for m in self._all(db, "memories") if m["status"] != "deleted"][-100:],
+                    "settings": self._settings(db), "revision": self._agent_revision(db, recording_id)}
+
+    def prepare_agent_memories(self, snapshot: dict, proposals: list[dict]) -> list[dict]:
+        """Assign source, time, identity and version fields outside the model's control."""
+        recording = snapshot["recording"]
+        sources = {segment["id"]: segment for segment in snapshot["segments"]}
+        with self._connect() as db:
+            existing = self._all(db, "memories")
+        existing_ids = {memory["id"] for memory in existing}
+        protected_segments = {memory["segment_id"] for memory in existing
+                              if memory.get("reviewed") or memory.get("user_corrected") or memory["status"] == "deleted"}
+        if not isinstance(proposals, list) or len(proposals) > 100:
+            raise ValueError("DeepSeek memory output must be a list of at most 100 items.")
+        output = {}
+        for raw in proposals:
+            segment = sources.get(raw.get("source_segment_id"))
+            quote, content = raw.get("quote"), raw.get("content")
+            if not segment or not isinstance(quote, str) or not quote.strip() or quote not in segment["text"]:
+                raise ValueError("DeepSeek cited an unknown source or a quote not present in the transcript.")
+            if not isinstance(content, str) or not content.strip() or len(content) > 4000:
+                raise ValueError("DeepSeek returned invalid memory content.")
+            if raw.get("category") not in CATEGORIES or raw.get("memory_type") not in {"episodic", "semantic"}:
+                raise ValueError("DeepSeek returned an invalid memory category/type.")
+            if raw.get("scope") not in {"recorded_conversation", "stated_preference", "current_context"}:
+                raise ValueError("DeepSeek returned an invalid memory scope.")
+            ident = str(uuid.uuid5(uuid.NAMESPACE_URL, _dump([recording["id"], segment["id"], quote, content])))
+            if ident in existing_ids or segment["id"] in protected_segments:
+                continue
+            identity_confirmed = segment["subject_id"] == "user"
+            output[ident] = {
+                "id": ident, "recording_id": recording["id"], "segment_id": segment["id"],
+                "content": content.strip(), "category": raw["category"], "memory_type": raw["memory_type"],
+                "scope": raw["scope"], "event_time": recording.get("recorded_at"),
+                "subject_id": "user" if identity_confirmed else "unknown",
+                "confirmed": identity_confirmed, "reviewed": False, "evidence_kind": "ai_inference",
+                "status": "active" if identity_confirmed else "pending", "version": 1, "follow_up": None,
+                "is_demo": recording["is_demo"], "extraction_mode": "deepseek", "source_quote": quote,
+                "source_refs": [{"recording_id": recording["id"], "segment_id": segment["id"],
+                                 "start": segment["start"], "end": segment["end"], "text": segment["text"],
+                                 "is_demo": recording["is_demo"]}],
+                "created_at": _now().isoformat(), "updated_at": _now().isoformat(),
+            }
+        return list(output.values())
+
+    def apply_agent_memories(self, recording_id: str, memories: list[dict], expected_revision: str, report: dict) -> dict:
+        with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._agent_revision(db, recording_id) != expected_revision:
+                raise VersionConflict("Sources, memories or preferences changed during DeepSeek processing; please retry.")
+            recording = self._get(db, "recordings", recording_id)
+            report = dict(report)
+            if "transcript_groups" in report:
+                if report.get("status") != "completed":
+                    raise ValueError("Transcript groups require a successfully completed memory pipeline.")
+                sources = [json.loads(row[0]) for row in db.execute(
+                    "SELECT payload FROM segments WHERE recording_id=?", (recording_id,))]
+                report["transcript_groups"] = validate_transcript_groups(
+                    report["transcript_groups"], sorted(sources, key=lambda source: source["start"]))
+            for memory in memories:
+                # A retry cannot resurrect a tombstone or overwrite a user's correction.
+                if db.execute("SELECT 1 FROM memories WHERE id=?", (memory["id"],)).fetchone():
+                    continue
+                if any(m["segment_id"] == memory["segment_id"] and (m.get("reviewed") or m.get("user_corrected"))
+                       for m in self._all(db, "memories")):
+                    continue
+                db.execute("INSERT INTO memories VALUES (?,?,?,?,?)", (memory["id"], recording_id,
+                           memory["segment_id"], memory["status"], _dump(memory)))
+                db.execute("INSERT INTO memory_versions VALUES (?,?,?)", (memory["id"], 1, _dump(memory)))
+            report = {**report, "memory_ids": [m["id"] for m in self._all(db, "memories")
+                                               if m["recording_id"] == recording_id and m["status"] != "deleted"
+                                               and m.get("extraction_mode") == "deepseek"]}
+            if "transcript_groups" in report:
+                self._save_topics(db, recording, report["transcript_groups"], self._sources(db, recording_id))
+            recording.update(extraction_mode="deepseek", memory_pipeline=report)
+            self._save_recording(db, recording)
+        return self.get_recording(recording_id)
 
     def _new_version(self, db: sqlite3.Connection, current: dict, replacement: dict) -> dict:
         old = {**current, "status": "superseded"}
@@ -282,15 +669,22 @@ class Engine:
                 raise ValueError("選取的片段不屬於這段錄音。")
             if not requested:
                 raise ValueError("請至少選擇一段屬於自己的片段。")
+            identity_changed = False
             for segment in rows:
                 if segment["id"] not in requested:
                     continue
+                identity_changed |= (segment["subject_id"] != "user" or not segment["confirmed"]
+                                     or segment["speaker"] != "user")
                 segment.update(subject_id="user", speaker="user", confirmed=True)
                 db.execute("UPDATE segments SET payload=? WHERE id=?", (_dump(segment), segment["id"]))
                 for memory in self._all(db, "memories"):
                     if memory["segment_id"] == segment["id"] and memory["status"] == "pending":
                         self._new_version(db, memory, {**memory, "subject_id": "user", "confirmed": True,
-                                                     "evidence_kind": "user_confirmed", "status": "active"})
+                                                     "evidence_kind": "ai_inference" if memory.get("extraction_mode") == "deepseek" else "user_confirmed",
+                                                     "status": "active"})
+            if identity_changed:
+                # A recording may have transcript groups but no extracted facts.
+                self._clear_agent_reports(db)
         return self.get_recording(recording_id)
 
     def get_source(self, memory_id: str) -> dict:
@@ -321,6 +715,7 @@ class Engine:
                 follow_up = {"due_at": due.isoformat() if due else None, "allowed": follow_up.get("allowed", False),
                              "completed": follow_up.get("completed", False)}
             replacement = {**current, "content": content, "confirmed": bool(confirmed),
+                           "user_corrected": True,
                            "subject_id": "user" if confirmed else "unknown",
                            "status": "active" if confirmed else "pending", "category": self._category(content),
                            "evidence_kind": "user_confirmed" if confirmed else "direct_expression",
@@ -331,7 +726,22 @@ class Engine:
                                current.get("follow_up") if content == current["content"] else None)}
             return self._new_version(db, current, replacement)
 
+    def _clear_agent_reports(self, db: sqlite3.Connection) -> None:
+        for recording in self._all(db, "recordings"):
+            self._preserve_legacy_topics(db, recording)
+            report = recording.get("memory_pipeline")
+            if report and report.get("status") in {"completed", "stale"}:
+                recording["memory_pipeline"] = {"status": "stale", "stage": "pending", "error": None,
+                                                "model": report.get("model"), "stages": []}
+                self._save_recording(db, recording)
+            elif report and "transcript_groups" in report:
+                # Remove legacy/interrupted groups even outside terminal states.
+                recording["memory_pipeline"] = {key: value for key, value in report.items()
+                                                if key != "transcript_groups"}
+                self._save_recording(db, recording)
+
     def _invalidate(self, db: sqlite3.Connection, memory_ids: set[str], reason: str) -> None:
+        self._clear_agent_reports(db)
         for row in db.execute("SELECT id,payload FROM card_reviews").fetchall():
             review = json.loads(row["payload"])
             if memory_ids.intersection(review.get("memory_ids", [])):
@@ -343,8 +753,12 @@ class Engine:
         for card in self._all(db, "proactive"):
             if memory_ids.intersection(card.get("memory_ids", [])):
                 # Derived content must disappear as soon as evidence is edited/deleted.
-                card.update(status="invalidated", title="已取消的提示", summary="", action_text="", source_refs=[],
+                receipt = self._automatic_receipt(card)
+                card.update(status="invalidated", title="Cancelled suggestion", summary="", action_text="", source_refs=[],
                             condition_reason=reason, versions={}, invalidated_at=_now().isoformat())
+                if receipt:
+                    card["automatic_receipt_at"] = receipt.isoformat()
+                card.pop("warning_trigger", None)
                 self._save_proactive(db, card)
 
     def _delete_memory(self, db: sqlite3.Connection, memory: dict) -> None:
@@ -371,6 +785,7 @@ class Engine:
             db.execute("DELETE FROM memory_versions WHERE memory_id=?", (ident,))
         db.execute("DELETE FROM memories WHERE recording_id=?", (recording["id"],))
         db.execute("DELETE FROM segments WHERE recording_id=?", (recording["id"],))
+        db.execute("DELETE FROM topic_versions WHERE recording_id=?", (recording["id"],))
         db.execute("DELETE FROM recordings WHERE id=?", (recording["id"],))
         if recording.get("file_path"):
             path = Path(recording["file_path"]).resolve()
@@ -417,6 +832,7 @@ class Engine:
                     stamp = _time(value, nullable=True)
                     settings[name] = stamp.isoformat() if stamp else None
             db.execute("UPDATE settings SET payload=? WHERE id=1", (_dump(settings),))
+            self._clear_agent_reports(db)
             self._revalidate(db, _now())
             return settings
 
@@ -456,7 +872,63 @@ class Engine:
 
     @staticmethod
     def _comfort_signal(text: str) -> bool:
-        return bool(re.search(r"\b(please comfort me|I (?:would like|need|want) (?:some )?reassurance|I need emotional support)\b", text, re.I))
+        return Engine._direct_request(text, r"\b(please comfort me|I (?:would like|need|want) (?:some )?reassurance|I need emotional support)\b")
+
+    @staticmethod
+    def _direct_context(text: str, start: int, end: int | None = None) -> bool:
+        """Conservative English guards; reported/conditional words are not requests."""
+        before = text[:start]
+        # Apostrophes inside words (don't, I'm) are not quotation delimiters.
+        if (before.count('"') % 2 or before.count("“") > before.count("”")
+                or before.count("‘") > before.count("’")
+                or len(re.findall(r"(?<!\w)'|'(?!\w)", before)) % 2):
+            return False
+        sentence = re.split(r"[.!?;\n]", before)[-1]
+        if re.search(
+            r"\b(if|unless|whether|suppose|imagine|example|said|says|asked|asks|told|quoted|wrote|writes)\b", sentence, re.I):
+            return False
+        clause = re.split(r",|\b(?:but|however)\b", sentence, flags=re.I)[-1]
+        if re.search(r"\b(never|not|no longer|don't|didn't|doesn't|wouldn't|can't|cannot)\b", clause, re.I):
+            return False
+        if end is not None and not re.search(r"[.!?;\n]\s*$", text[start:end]):
+            suffix = re.split(r"[.!?;\n]", text[end:], maxsplit=1)[0]
+            if re.search(r"\b(if|unless|whether)\b", suffix, re.I):
+                return False
+        return True
+
+    @staticmethod
+    def _direct_request(text: str, pattern: str) -> bool:
+        for match in re.finditer(pattern, text, re.I):
+            if Engine._direct_context(text, match.start(), match.end()):
+                return True
+        return False
+
+    def _condition_texts(self, db: sqlite3.Connection, memory: dict) -> list[str]:
+        """Use an exact current quote only while no user correction supersedes it.
+
+        Never use a whole-segment fallback: another atom in the same speech
+        window may describe an unrelated event or somebody else's request.
+        """
+        content = memory["content"]
+        if memory.get("user_corrected") or memory.get("reviewed"):
+            return [content]
+        quote = memory.get("source_quote")
+        if not isinstance(quote, str) or not quote.strip():
+            return [content]
+        try:
+            source = self._get(db, "segments", memory["segment_id"])
+            recording = self._get(db, "recordings", memory["recording_id"])
+        except NotFoundError:
+            return [content]
+        if (source.get("recording_id") != recording["id"] or source.get("subject_id") != "user"
+                or source.get("confirmed") is not True or recording.get("status") not in {"ready", "completed"}
+                or not any(ref.get("recording_id") == recording["id"] and ref.get("segment_id") == source["id"]
+                           for ref in memory.get("source_refs", []))):
+            return [content]
+        positions = [match.start() for match in re.finditer(re.escape(quote), source["text"])]
+        if not any(self._direct_context(source["text"], start, start + len(quote)) for start in positions):
+            return [content]
+        return list(dict.fromkeys([content, quote]))
 
     @staticmethod
     def _local_understanding(text: str) -> str | None:
@@ -468,47 +940,47 @@ class Engine:
             return None
         if Engine._sleep_signal(text):
             hours = re.search(r"(?:only )?slept (\d+(?:\.\d+)?) hours?", value)
-            return f"你提到只睡了 {hours.group(1)} 小時，並表示睡眠不足。" if hours else "你明確提到睡眠不足。"
+            return f"You mentioned sleeping only {hours.group(1)} hours and said it was not enough." if hours else "You explicitly mentioned not getting enough sleep."
         if re.search(r"\b(talked|conversation)\b", value) and re.search(r"\b(friend|friends)\b", value):
             if re.search(r"\b(feel|felt|feeling) (?:a little |much )?better\b", value):
-                return "你提到與朋友交談後，感覺好些。"
+                return "You mentioned feeling better after talking with a friend."
             friend = re.search(r"\bmy friend ([A-Z][a-z]+)\b", text)
-            who = f"朋友 {friend.group(1)}" if friend else "朋友"
-            topic = "，內容與小組項目有關" if "group project" in value else ""
-            return f"你提到與{who}交談{topic}。"
+            who = f"your friend {friend.group(1)}" if friend else "a friend"
+            topic = " about your group project" if "group project" in value else ""
+            return f"You mentioned talking with {who}{topic}."
         if Engine._lonely_signal(text):
-            return "你提到感到孤單或與人交談有困難。"
+            return "You mentioned feeling lonely or finding it hard to talk with people."
         if "presentation" in value and re.search(r"\b(finished|completed|sent)\b", value):
             if "draft" in value:
-                return "你提到已完成簡報草稿。" if "sent" not in value else "你提到已交出簡報草稿。"
-            return "你提到已完成簡報。"
+                return "You mentioned finishing the presentation draft." if "sent" not in value else "You mentioned sending the presentation draft."
+            return "You mentioned finishing the presentation."
         if "presentation" in value and re.search(r"\b(send|share)\b", value):
-            return "你提到需要交出或分享簡報草稿。"
+            return "You mentioned needing to send or share the presentation draft."
         slides = re.search(r"\btomorrow i need to review my slides at (\d{1,2}) in the morning\b", value)
         if slides and 1 <= int(slides.group(1)) <= 12:
-            return f"你提到明天早上 {int(slides.group(1))} 時需要檢查簡報內容。"
+            return f"You mentioned needing to review your slides at {int(slides.group(1))} tomorrow morning."
         if re.search(r"\bplease remind me to prepare before the meeting\b", value):
-            return "你表達了希望在會議前準備並收到提醒的意願，具體時間及提醒設定仍待確認。"
+            return "You expressed a wish to prepare before the meeting and be reminded; the exact time and reminder settings are still unconfirmed."
         if Engine._suggestion(text):
-            return "你明確表示需要協助，當中有可以進一步處理的具體事項。"
+            return "You explicitly asked for help, including something specific that can be acted on."
         if "presentation" in value and "nervous" in value and "not prepared" in value:
-            return "你提到簡報前感到緊張，因為內容尚未準備好。"
-        mood_words = {"nervous": "緊張", "anxious": "焦慮", "worried": "擔心", "sad": "難過", "happy": "開心", "calm": "平靜", "excited": "興奮"}
+            return "You mentioned feeling nervous before the presentation because the content was not ready."
+        mood_words = {"nervous": "nervous", "anxious": "anxious", "worried": "worried", "sad": "sad", "happy": "happy", "calm": "calm", "excited": "excited"}
         for word, label in mood_words.items():
             if re.search(rf"\b(?:i (?:feel|felt|am|was)|feeling) (?:a little |very )?{word}\b", value):
-                return f"你提到感到{label}。"
+                return f"You mentioned feeling {label}."
         if Engine._stress_signal(text):
-            return "你明確提到近期感到壓力。"
+            return "You explicitly mentioned feeling stressed recently."
         if Engine._comfort_signal(text):
-            return "你明確表示希望得到安慰或情緒支持。"
+            return "You explicitly said you wanted comfort or emotional support."
         if "fictional warning demonstration" in value:
-            return "這是一段清楚標示的虛構警示流程演示。"
+            return "This is a clearly labelled fictional warning-flow demonstration."
         if "i prefer" in value and ("quiet" in value or "calm" in value):
-            return "你表達了較喜歡安靜場合的偏好。"
+            return "You expressed a preference for quieter settings."
         return None
 
     def _daily_cards(self, memories: list[dict], date: str) -> list[dict]:
-        titles = {"mood": "今天的心情", "social": "今天的社交", "moments": "值得記住的事"}
+        titles = {"mood": "Today's mood", "social": "Today's social side", "moments": "Worth remembering"}
         cards = []
         for category in CATEGORIES:
             rows = [m for m in memories if self._eligible(m) and m["category"] == category]
@@ -517,12 +989,14 @@ class Engine:
             # Same utterance does not inflate a narrative, although all independent sources remain traceable.
             paraphrases = [self._local_understanding(m["content"]) for m in rows]
             texts = list(dict.fromkeys(filter(None, paraphrases)))
-            summary = "\n".join(texts[:5]) if texts else "目前沒有可由本機規則可靠歸納的內容，請查看原話並修正理解。"
+            summary = "\n".join(texts[:5]) if texts else "The local rules could not reliably summarise this yet; view the original words and correct the understanding."
             unknown_count = sum(text is None for text in paraphrases)
             if texts and unknown_count:
-                summary += f"\n另外有 {unknown_count} 則記憶未能可靠歸納，請查看原話並修正理解。"
+                summary += f"\nAnother {unknown_count} memor{'y' if unknown_count == 1 else 'ies'} could not be reliably summarised; view the original words and correct the understanding."
             if len(texts) > 5:
-                summary += f"\n另有 {len(texts) - 5} 項已辨識內容，請在來源查看完整內容。"
+                summary += f"\nThere are {len(texts) - 5} more recognised items; view the sources for the full content."
+            if self.model_mode:
+                summary = "Daily summary has not yet been generated for these sources."
             refs = {r["segment_id"]: r for m in rows for r in m["source_refs"]}
             cards.append({"id": f"daily-{date}-{category}", "category": category, "title": titles[category],
                           "summary": summary,
@@ -532,11 +1006,24 @@ class Engine:
                           "is_demo": any(m["is_demo"] for m in rows),
                           "demo_only": all(m["is_demo"] for m in rows),
                           "provisional": any(m["evidence_kind"] == "ai_inference" for m in rows),
-                          "extraction_mode": "local_rules", "analysis_mode": "local_rules",
-                          "summary_mode": "local_rule_summary"})
+                          "extraction_mode": "deepseek" if any(m.get("extraction_mode") == "deepseek" for m in rows) else "local_rules",
+                          "analysis_mode": "pending" if self.model_mode else "local_rules",
+                          "summary_mode": "pending" if self.model_mode else "local_rule_summary"})
         return cards
 
-    def apply_card_summaries(self, date: str, summaries: list[dict], expected_versions: dict[str, int]) -> dict:
+    def invalidate_card_summaries_for_recording(self, recording_id: str) -> None:
+        """A topic correction can invalidate prose without changing atomic versions."""
+        with self._lock, self._connect() as db:
+            self._get(db, "recordings", recording_id)
+            dates = {_time(memory["event_time"]).date().isoformat() for memory in self._all(db, "memories")
+                     if memory["recording_id"] == recording_id and memory["status"] != "deleted"
+                     and memory.get("event_time")}
+            for date in dates:
+                db.execute("DELETE FROM card_summaries WHERE date=?", (date,))
+                db.execute("DELETE FROM card_reviews WHERE id LIKE ?", (f"daily-{date}-%",))
+
+    def apply_card_summaries(self, date: str, summaries: list[dict], expected_versions: dict[str, int], *,
+                             expected_categories: dict[str, str] | None = None) -> dict:
         """Cache optional model prose only while every evidence dependency is current.
 
         expected_versions is the whole snapshot given to the model. Per-category
@@ -547,13 +1034,23 @@ class Engine:
         if not isinstance(summaries, list) or not isinstance(expected_versions, dict):
             raise ValueError("模型摘要格式不正確。")
         with self._lock, self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             active = {m["id"]: m for m in self._memories_for_date(db, selected) if self._eligible(m)}
+            if expected_categories is not None and (
+                    set(active) != set(expected_versions) or set(active) != set(expected_categories)
+                    or any(memory["category"] != expected_categories[ident] for ident, memory in active.items())):
+                raise VersionConflict("Daily-summary source membership or categories changed during generation.")
             for ident, version in expected_versions.items():
                 if ident not in active or active[ident]["version"] != version:
                     raise VersionConflict("模型處理期間來源已更新，請重新生成摘要。")
                 segment = self._get(db, "segments", active[ident]["segment_id"])
                 if segment["subject_id"] != "user":
                     raise VersionConflict("模型摘要依據尚未確認主體。")
+                if expected_categories is not None:
+                    recording = self._get(db, "recordings", active[ident]["recording_id"])
+                    if (segment.get("confirmed") is not True or segment.get("recording_id") != recording["id"]
+                            or recording.get("status") not in {"ready", "completed"}):
+                        raise VersionConflict("Daily-summary identity or source status changed during generation.")
             values = []
             for raw in summaries:
                 category = raw.get("category")
@@ -588,7 +1085,7 @@ class Engine:
             row = db.execute("SELECT payload FROM card_reviews WHERE id=?", (card["id"],)).fetchone()
             confirmed = row is not None and json.loads(row[0])["review_token"] == token
             card.update(review_token=token, review_status="confirmed" if confirmed else "pending",
-                        review_prompt="這些事情有發生嗎？我有理解對你嗎？需要怎樣修改？",
+                        review_prompt="Did these things happen? Did I understand you correctly? What needs to change?",
                         provisional=not confirmed or card["analysis_mode"] == "llm")
         return cards
 
@@ -602,6 +1099,8 @@ class Engine:
             card = next((item for item in cards if item["id"] == card_id), None)
             if not card or card["versions"] != expected_versions or card["review_token"] != review_token:
                 raise VersionConflict("卡片摘要或來源已更新，請重新查看再核實。")
+            if self.model_mode and card.get("analysis_mode") != "llm":
+                raise ValueError("Generate the DeepSeek card before confirming its understanding.")
             for ident in card["memory_ids"]:
                 memory = self._get(db, "memories", ident)
                 source = self._get(db, "segments", memory["segment_id"])
@@ -613,20 +1112,21 @@ class Engine:
             review = {"review_token": review_token, "memory_ids": card["memory_ids"],
                       "versions": expected_versions, "reviewed_at": _now().isoformat()}
             db.execute("INSERT INTO card_reviews VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", (card_id, _dump(review)))
+            self._clear_agent_reports(db)
             self._revalidate(db, _now())
         return self.state(selected)
 
     @staticmethod
     def _suggestion(text: str) -> str | None:
         patterns = [
-            (r"\b(I need help|help me|I want advice).*(presentation|presenting)\b", "先寫下簡報的三個重點，再用一分鐘練習開場。"),
-            (r"\b(I need help|help me|I want advice).*(study|studying|exam)\b", "選一個最需要複習的主題，安排一段短時間練習。"),
-            (r"\b(I need help|help me|I want advice).*(friend|conversation|talking|social)\b", "可先選一位熟悉的朋友，約一次短時間交談。"),
+            (r"\b(I need help|help me|I want advice).*(presentation|presenting)\b", "Write down the three key points of the presentation, then practise the opening for one minute."),
+            (r"\b(I need help|help me|I want advice).*(study|studying|exam)\b", "Pick the topic that most needs revision and set aside a short practice block."),
+            (r"\b(I need help|help me|I want advice).*(friend|conversation|talking|social)\b", "Choose a friend you know well and arrange a short conversation."),
         ]
-        return next((action for pattern, action in patterns if re.search(pattern, text, re.I)), None)
+        return next((action for pattern, action in patterns if Engine._direct_request(text, pattern)), None)
 
     def _support_eligible(self, db: sqlite3.Connection, memory: dict, now: datetime) -> bool:
-        if not self._eligible(memory) or memory.get("reviewed") is not True or not memory.get("event_time"):
+        if not self._eligible(memory) or not memory.get("event_time"):
             return False
         if _time(memory["event_time"]) > now:
             return False
@@ -637,6 +1137,66 @@ class Engine:
             return False
         return source.get("subject_id") == "user" and recording["status"] in {"ready", "completed"}
 
+    def _warning_texts(self, db: sqlite3.Connection, memory: dict) -> list[str]:
+        """Warning needs the current correction or an exact, attributed quote.
+
+        A model paraphrase cannot establish distress. In particular, do not
+        borrow another atom's words from its larger transcript segment.
+        """
+        try:
+            source = self._get(db, "segments", memory["segment_id"])
+            recording = self._get(db, "recordings", memory["recording_id"])
+        except NotFoundError:
+            return []
+        if (memory.get("is_demo") or recording.get("is_demo")
+                or source.get("recording_id") != recording["id"]
+                or source.get("subject_id") != "user" or source.get("confirmed") is not True
+                or not any(ref.get("recording_id") == recording["id"] and ref.get("segment_id") == source["id"]
+                           for ref in memory.get("source_refs", []))):
+            return []
+        if memory.get("user_corrected") or memory.get("reviewed"):
+            return [memory["content"]]
+        quote = memory.get("source_quote")
+        if not quote and memory.get("extraction_mode") == "local_rules":
+            quote = memory["content"]
+        if not isinstance(quote, str) or not quote.strip():
+            return []
+        positions = [match.start() for match in re.finditer(re.escape(quote), source["text"])]
+        if not any(direct_distress_context(source["text"], start, start + len(quote)) for start in positions):
+            return []
+        return [quote]
+
+    def _real_warning_candidate(self, db, all_rows, now):
+        grounded = {memory["id"]: self._warning_texts(db, memory) for memory in all_rows}
+        current = [memory for memory in all_rows if _time(memory["event_time"]).date() == now.date()]
+        acute = [memory for memory in current if any(strong_distress(text) for text in grounded[memory["id"]])]
+        basis, rows, topics = "acute_distress", acute, set()
+        if acute:
+            topics = {topic for memory in acute for text in grounded[memory["id"]] for topic in distress_topics(text)}
+        else:
+            by_topic = {}
+            for memory in all_rows:
+                day = _time(memory["event_time"]).date()
+                if not now.date() - timedelta(days=6) <= day <= now.date():
+                    continue
+                for topic in {topic for text in grounded[memory["id"]] for topic in distress_topics(text)}:
+                    by_topic.setdefault(topic, []).append(memory)
+            matched = [(topic, memories) for topic, memories in by_topic.items()
+                       if len({_time(memory["event_time"]).date() for memory in memories}) >= 3
+                       and any(_time(memory["event_time"]).date() == now.date() for memory in memories)]
+            if not matched:
+                return None
+            topic, rows = sorted(matched, key=lambda pair: (-len({_time(m["event_time"]).date() for m in pair[1]}), pair[0]))[0]
+            basis, topics = "repeated_distress", {topic}
+        rows = list({memory["id"]: memory for memory in rows}.values())
+        dates = sorted({_time(memory["event_time"]).date().isoformat() for memory in rows})
+        evidence = [{"memory_id": memory["id"], "text": text}
+                    for memory in rows for text in grounded[memory["id"]]
+                    if (strong_distress(text) if basis == "acute_distress" else topics.intersection(distress_topics(text)))]
+        return {"rows": rows, "support_basis": basis, "warning_trigger": {
+            "basis": basis, "topics": sorted(topics), "dates": dates, "day_count": len(dates),
+            "window_days": 1 if basis == "acute_distress" else 7, "evidence_quotes": evidence}}
+
     def _support_candidates(self, db: sqlite3.Connection, date: str, now: datetime) -> dict:
         settings = self._settings(db)
         candidates = {kind: {"rows": [], "support_basis": "current_request"} for kind in KINDS}
@@ -644,6 +1204,9 @@ class Engine:
         if date != now.date().isoformat():
             return candidates
         all_rows = [m for m in self._all(db, "memories") if self._support_eligible(db, m, now)]
+        texts = {memory["id"]: self._condition_texts(db, memory) for memory in all_rows}
+        def signal(memory, predicate):
+            return any(predicate(text) for text in texts[memory["id"]])
         current = [m for m in all_rows if _time(m["event_time"]).date() == now.date()]
         history = [m for m in all_rows if _time(m["event_time"]).date() < now.date()]
         for memory in all_rows:
@@ -652,27 +1215,34 @@ class Engine:
                     and follow.get("completed") is False and follow.get("due_at") and _time(follow["due_at"]) <= now):
                 candidates["reminder"]["rows"].append(memory)
         for memory in current:
-            if settings["preferences"]["suggestion"] and self._suggestion(memory["content"]):
+            if settings["preferences"]["suggestion"] and signal(memory, self._suggestion):
                 candidates["suggestion"]["rows"].append(memory)
-            if settings["preferences"]["comfort"] and self._comfort_signal(memory["content"]):
+            if settings["preferences"]["comfort"] and signal(memory, self._comfort_signal):
                 candidates["comfort"]["rows"].append(memory)
             if (settings["preferences"]["warning"] and settings["warning_demo_enabled"] and memory["is_demo"]
                     and "fictional warning demonstration" in memory["content"].lower()):
                 candidates["warning"]["rows"].append(memory)
-        recent_sleep = [m for m in all_rows if self._sleep_signal(m["content"])
+                candidates["warning"]["support_basis"] = "fictional_warning"
+        if settings["preferences"]["warning"]:
+            real_warning = self._real_warning_candidate(db, all_rows, now)
+            if real_warning:
+                candidates["warning"] = real_warning
+        recent_sleep = [m for m in all_rows if signal(m, self._sleep_signal)
                         and now.date() - timedelta(days=6) <= _time(m["event_time"]).date() <= now.date()]
         sleep_dates = {_time(m["event_time"]).date() for m in recent_sleep}
         scheduled = any(m.get("follow_up", {}) and m["follow_up"].get("allowed")
                         and not m["follow_up"].get("completed") for m in recent_sleep)
         if settings["preferences"]["suggestion"] and len(sleep_dates) >= 3 and now.date() in sleep_dates and not scheduled:
             candidates["suggestion"] = {"rows": recent_sleep, "support_basis": "sleep_pattern"}
-        lonely_history = [m for m in history if self._lonely_signal(m["content"])]
-        improved_social = [m for m in current if not self._negated(m["content"], r"talk(?:ed)?|conversation|better")
-                           and re.search(r"\bI\b.*\b(talked|conversation)\b.*\b(friend|friends)\b", m["content"], re.I)
-                           and re.search(r"\b(feel|felt|feeling) (?:a little |much )?better\b", m["content"], re.I)]
-        past_stress = [m for m in history if self._stress_signal(m["content"])]
-        present_stress = [m for m in current if self._stress_signal(m["content"])]
-        request = [m for m in current if self._comfort_signal(m["content"])]
+        lonely_history = [m for m in history if signal(m, self._lonely_signal)]
+        def social_improvement(text):
+            return (not self._negated(text, r"talk(?:ed)?|conversation|better")
+                    and re.search(r"\bI\b.*\b(talked|conversation)\b.*\b(friend|friends)\b", text, re.I)
+                    and re.search(r"\b(feel|felt|feeling) (?:a little |much )?better\b", text, re.I))
+        improved_social = [m for m in current if signal(m, social_improvement)]
+        past_stress = [m for m in history if signal(m, self._stress_signal)]
+        present_stress = [m for m in current if signal(m, self._stress_signal)]
+        request = [m for m in current if signal(m, self._comfort_signal)]
         if settings["preferences"]["comfort"] and lonely_history and improved_social:
             candidates["comfort"] = {"rows": lonely_history + improved_social, "support_basis": "social_follow_up"}
         elif settings["preferences"]["comfort"] and past_stress and present_stress and request:
@@ -684,39 +1254,305 @@ class Engine:
     def _matches(self, db: sqlite3.Connection, date: str, now: datetime) -> dict[str, list[dict]]:
         return {kind: candidate["rows"] for kind, candidate in self._support_candidates(db, date, now).items()}
 
+    def _automatic_matches(self, db, matches, now):
+        available = {kind: [] if self._schedule_block(db, kind, now) else rows for kind, rows in matches.items()}
+        # Explicit real distress has a defined priority. A future Warning time
+        # does not suppress other support, and fictional fixtures add no priority.
+        if available["warning"] and any(not memory.get("is_demo") for memory in available["warning"]):
+            return {kind: rows if kind == "warning" else [] for kind, rows in available.items()}
+        return available
+
+    def _type_conditions(self, db, date: str, now: datetime, matches: dict[str, list[dict]]) -> dict:
+        settings = self._settings(db)
+        eligible = [memory for memory in self._all(db, "memories") if self._support_eligible(db, memory, now)]
+        current = [memory for memory in eligible if _time(memory["event_time"]).date() == now.date()]
+        existing = self._all(db, "proactive")
+        automatic_times = [receipt for card in existing if (receipt := self._automatic_receipt(card))]
+        automatic_matches = self._automatic_matches(db, matches, now)
+        warning_priority = bool(automatic_matches["warning"] and any(
+            not memory.get("is_demo") for memory in automatic_matches["warning"]))
+        warning_candidate = self._support_candidates(db, date, now)["warning"]
+        result = {}
+        for kind in KINDS:
+            enabled, matched = settings["preferences"][kind], bool(matches[kind])
+            code, reason = "conditions_met", "The source conditions for this support type are met."
+            if not enabled:
+                code, reason = "preference_disabled", "This support type is turned off in your preferences."
+            elif date != now.date().isoformat():
+                code, reason = "historical_view", "Proactive support is checked for today in Hong Kong; this view is another date."
+            elif not matched:
+                if not (eligible if kind == "reminder" else current):
+                    code, reason = "no_eligible_sources", "No current, identity-confirmed source with a known time is eligible for this support type."
+                elif kind == "reminder":
+                    allowed = [memory["follow_up"] for memory in eligible if memory.get("follow_up", {})
+                               and memory["follow_up"].get("allowed") is True
+                               and memory["follow_up"].get("completed") is False]
+                    if not allowed:
+                        code, reason = "no_allowed_follow_up", "No unfinished follow-up has your explicit permission. A reminder needs permission and a due time."
+                    elif not any(follow.get("due_at") for follow in allowed):
+                        code, reason = "no_due_time", "An allowed follow-up needs a due time before a reminder can be shown."
+                    else:
+                        code, reason = "not_due", "Your allowed, unfinished follow-ups are not due yet."
+                elif kind == "suggestion":
+                    code, reason = "no_explicit_actionable_request", "No explicit request for practical help with a presentation, study/exams or social conversation was found, and no supported sleep pattern matched."
+                elif kind == "comfort":
+                    code, reason = "no_explicit_support_request", "No explicit reassurance/support request or supported follow-up pattern was found."
+                else:
+                    code, reason = "no_distress_warning_condition", (
+                        "Warning needs your confirmed words describing strong distress today, or the same distress topic "
+                        "on at least three distinct days in the last seven, including today.")
+            elif kind == "warning":
+                basis = warning_candidate["support_basis"]
+                if basis == "acute_distress":
+                    reason = "Your confirmed words explicitly describe strong distress today. This is a support prompt, not a diagnosis."
+                elif basis == "repeated_distress":
+                    count = warning_candidate["warning_trigger"]["day_count"]
+                    reason = f"Your confirmed words describe the same distress topic on {count} distinct days in the last seven, including today."
+                else:
+                    reason = "A clearly labelled fictional Warning example is enabled by both demo permissions."
+            result[kind] = {"enabled": enabled, "condition_met": matched, "matched_memory_count": len(matches[kind]),
+                            "reason_code": code, "reason": reason}
+            if kind == "warning" and matched:
+                result[kind]["support_basis"] = warning_candidate["support_basis"]
+                if warning_candidate.get("warning_trigger"):
+                    result[kind]["warning_trigger"] = warning_candidate["warning_trigger"]
+            status, delivery_reason = ("not_matched", reason) if enabled else ("disabled", reason)
+            pending_schedule = self._schedule_pending(db, kind, now)
+            schedule = self._display_schedule(db, kind)
+            scheduled_authorization = bool(schedule["display_at"] and schedule["revision"] != schedule["fulfilled_revision"])
+            feedback = False
+            ambiguous = len([rows for rows in automatic_matches.values() if rows]) > 1
+            priority_blocked = warning_priority and kind != "warning"
+            if matched:
+                versions = {memory["id"]: memory["version"] for memory in matches[kind]}
+                same = [card for card in existing if card["date"] == date and card["type"] == kind
+                        and card["versions"] == versions]
+                active = next((card for card in same if card["status"] == "active"), None)
+                visible = active and (not self.model_mode or active.get("generation_mode") == "llm")
+                feedback = not scheduled_authorization and any(card["status"] in {"dismissed", "done"} or
+                    card["status"] == "snoozed" and self._requested_support(card)
+                               for card in same)
+                blocked = self._common_block(settings, now) or self._schedule_block(db, kind, now)
+                if visible:
+                    status, delivery_reason = "shown", "The current support card is available."
+                    if self._requested_support(active):
+                        delivery_reason = "Your requested support is shown. Automatic delivery settings are unchanged."
+                        if blocked:
+                            delivery_reason += " " + blocked
+                elif active and self._requested_support(active):
+                    status, delivery_reason = "eligible", "Your requested support is being generated."
+                elif blocked:
+                    status, delivery_reason = "paused", blocked
+                elif priority_blocked:
+                    status, delivery_reason = "paused", "A current Warning takes priority for automatic display. You can still request this support manually."
+                elif ambiguous:
+                    status, delivery_reason = "paused", "Several types match; automatic delivery has no priority rule."
+                elif feedback:
+                    status, delivery_reason = "paused", "This support was dismissed, snoozed or done; automatic delivery will not repeat it."
+                elif not pending_schedule and automatic_times and now < max(automatic_times) + timedelta(minutes=settings["frequency_minutes"]):
+                    status, delivery_reason = "paused", "The minimum interval before the next automatic support has not passed."
+                else:
+                    status, delivery_reason = "eligible", "The source conditions are met; support can be generated."
+            result[kind]["delivery"] = {"status": status, "reason": delivery_reason}
+            result[kind]["request_allowed"] = enabled and matched and date == now.date().isoformat()
+            displayed = [stamp for card in existing if card["type"] == kind and (stamp := self._displayed_at(card))]
+            effective = None
+            time_reason = delivery_reason
+            if enabled and matched and not settings["quiet_mode"] and not ambiguous and not feedback and not priority_blocked:
+                bounds = [now]
+                if schedule["display_at"]:
+                    bounds.append(_time(schedule["display_at"]))
+                if settings.get("snoozed_until"):
+                    bounds.append(_time(settings["snoozed_until"]))
+                if not scheduled_authorization and automatic_times:
+                    bounds.append(max(automatic_times) + timedelta(minutes=settings["frequency_minutes"]))
+                effective = max(bounds).isoformat()
+                time_reason = "Earliest permitted automatic display, subject to current sources, generation and the next app visit or poll."
+            elif enabled and matched:
+                if settings["quiet_mode"]:
+                    time_reason = self._common_block(settings, now)
+                elif priority_blocked:
+                    time_reason = "Automatic display waits while the current Warning has priority."
+                elif ambiguous:
+                    time_reason = "Several support types match; an automatic display time cannot be determined."
+                else:
+                    time_reason = "Previous feedback prevents automatic repeat until new evidence or an explicit new display time."
+            result[kind]["display_time"] = {"scheduled_at": schedule["display_at"], "effective_at": effective,
+                                            "displayed_at": max(displayed, key=_time) if displayed else None,
+                                            "reason": time_reason}
+        return result
+
+    @staticmethod
+    def _requested_support(card: dict) -> bool:
+        return card["type"] in KINDS and card.get("delivery_mode") == "requested"
+
+    @staticmethod
+    def _displayed_at(card: dict) -> str | None:
+        # Legacy ready LLM cards predate explicit release timestamps. Never use
+        # candidate creation time as evidence of a display.
+        if "displayed_at" in card:
+            return card["displayed_at"]
+        return card.get("generated_at") if card.get("generation_mode") == "llm" else None
+
+    @staticmethod
+    def _automatic_receipt(card: dict) -> datetime | None:
+        # Upgrading an already delivered automatic card must retain its original
+        # interval, while direct requests and their feedback add no new interval.
+        if card.get("automatic_receipt_at"):
+            return _time(card["automatic_receipt_at"])
+        if card.get("delivery_mode") != "requested" and card["status"] in {"active", "helpful", "dismissed", "snoozed", "done"}:
+            if "displayed_at" in card:
+                return _time(card.get("feedback_at") or card["displayed_at"]) if card["displayed_at"] else None
+            return _time(card.get("feedback_at", card["created_at"]))
+        return None
+
     def _common_block(self, settings: dict, now: datetime) -> str | None:
         if settings["quiet_mode"]:
-            return "免打擾已開啟，暫不展示主動關懷。"
+            return "Quiet mode is on, so proactive care is paused."
         if settings.get("snoozed_until") and _time(settings["snoozed_until"]) > now:
-            return "主動關懷仍在稍後提醒期間。"
+            return "Proactive care is still snoozed."
         return None
 
     def _revalidate(self, db: sqlite3.Connection, now: datetime) -> None:
         settings = self._settings(db)
         all_memories = {m["id"]: m for m in self._all(db, "memories")}
         for card in self._all(db, "proactive"):
-            if card["status"] != "active":
+            if card["status"] not in {"active", "scheduled"}:
                 continue
-            reason = self._common_block(settings, now)
+            requested = self._requested_support(card)
+            dormant = card["status"] == "scheduled"
+            if not requested and self._schedule_block(db, card["type"], now):
+                card.update(status="scheduled", delivery_mode="scheduled")
+                self._save_proactive(db, card)
+                dormant = True
+            reason = None if requested or dormant else self._common_block(settings, now)
             if not settings["preferences"].get(card["type"], False):
-                reason = "這類關懷已關閉。"
-            if card["type"] == "warning" and not settings["warning_demo_enabled"]:
-                reason = "虛構警示演示已關閉。"
+                reason = "This kind of care is turned off."
+            if (card["type"] == "warning" and card.get("demo_only", card.get("is_demo"))
+                    and not settings["warning_demo_enabled"]):
+                reason = "Fictional warning demos are turned off."
             matches = self._matches(db, card["date"], now)
-            matched_types = [k for k, rows in matches.items() if rows]
-            if matched_types != [card["type"]]:
-                reason = "來源條件已改變，或多類選擇規則未定；提示已取消。"
+            matched_types = [k for k, rows in self._automatic_matches(db, matches, now).items() if rows]
+            if (not matches[card["type"]] if requested or dormant else matched_types != [card["type"]]):
+                reason = "Source conditions changed, or several types match with no priority rule; the suggestion was cancelled."
+                if (not requested and not dormant and card["type"] != "warning" and matched_types == ["warning"]
+                        and any(not memory.get("is_demo") for memory in matches["warning"])):
+                    reason = "A current Warning has priority for automatic display; this automatic suggestion was cancelled."
             candidate_versions = {m["id"]: m["version"] for m in matches[card["type"]]}
             if candidate_versions != card["versions"]:
-                reason = "支持這項提示的來源集合或版本已改變，舊提示已取消。"
+                reason = "The source set or version behind this suggestion changed; the old suggestion was cancelled."
             for ident, version in card["versions"].items():
                 current = all_memories.get(ident)
                 if not current or not self._support_eligible(db, current, now) or current["version"] != version:
-                    reason = "來源版本已失效，舊提示已取消。"
+                    reason = "The source version is no longer valid; the old suggestion was cancelled."
+                    break
+                if (requested or dormant) and self._get(db, "segments", current["segment_id"]).get("confirmed") is not True:
+                    reason = "The speaker behind this support is no longer confirmed."
                     break
             if reason:
-                card.update(status="invalidated", title="已取消的提示", summary="", action_text="", source_refs=[], versions={}, condition_reason=reason)
+                receipt = self._automatic_receipt(card)
+                card.update(status="invalidated", title="Cancelled suggestion", summary="", action_text="", source_refs=[], versions={}, condition_reason=reason)
+                if receipt:
+                    card["automatic_receipt_at"] = receipt.isoformat()
+                card.pop("warning_trigger", None)
                 self._save_proactive(db, card)
+
+    def _new_support_card(self, db, selected, kind, rows, support_basis, stamp, warning_trigger=None):
+        versions = {memory["id"]: memory["version"] for memory in rows}
+        titles = {"reminder": "A follow-up you allowed", "suggestion": "A small step to try", "comfort": "A little support for you", "warning": "Fictional warning scenario demo"}
+        reasons = {
+            "reminder": "Confirmed as your own item, reminders allowed, now due, and not yet done.",
+            "suggestion": "You explicitly asked for help, and your words support one concrete, workable suggestion.",
+            "comfort": "You explicitly said you wanted comfort or support, and you allowed this kind of care.",
+            "warning": "The source is explicitly labelled as a fictional warning demo, and both warning switches are on.",
+        }
+        texts = {
+            "reminder": "You have a follow-up that is now due. You can look at the original words and decide whether to handle it now.",
+            "suggestion": next((action for text in self._condition_texts(db, rows[0])
+                                if (action := self._suggestion(text))), "Start with one small step."),
+            "comfort": "You have said you want support. Take a pause, give yourself a little space, then move at your own pace.",
+            "warning": "This is a fictional demo for testing suggestion conditions and feedback; it makes no illness or risk judgement.",
+        }
+        if kind == "reminder" and any(m.get("bedtime_reminder") for m in rows):
+            titles[kind] = "Your bedtime reminder"
+            texts[kind] = "Your bedtime reminder is due. You can get ready to rest whenever suits you."
+        if support_basis == "sleep_pattern":
+            titles[kind] = "Leave some time to rest tonight"
+            reasons[kind] = "Demo rule: verified words on three different days in the last seven (including today) explicitly mention not getting enough sleep; this is not a diagnosis threshold."
+            texts[kind] = "On several different days in the last week, including today, you explicitly mentioned not getting enough sleep. Leave some time to rest tonight. Would you like to set a bedtime reminder?"
+        elif support_basis == "social_follow_up":
+            titles[kind] = "That conversation is worth acknowledging"
+            reasons[kind] = "Verified past words mention loneliness or social difficulty, and today's verified words say you felt better after talking with a friend."
+            texts[kind] = "You mentioned feeling lonely or finding it hard to talk, and today you mentioned feeling better after chatting with a friend. That conversation is worth acknowledging; continue at a pace that feels comfortable."
+        elif support_basis == "emotional_follow_up":
+            titles[kind] = "Looking back on that stress with you"
+            reasons[kind] = "Verified words from both the past and today explicitly describe stress, and today you clearly asked for support."
+            texts[kind] = "You mentioned feeling stressed both before and today, and said you wanted support. Take a pause, pick one small thing you can handle right now, or talk with someone you trust."
+        elif support_basis == "acute_distress":
+            titles[kind] = "Please pause and reach out for support"
+            reasons[kind] = "Your current, identity-confirmed words explicitly describe strong distress today. This prompt follows what you said; it is not a diagnosis or a prediction."
+            texts[kind] = "Your words describe things feeling especially difficult right now. You deserve support with this. If you can, pause nonessential tasks and reach out to someone you trust to talk or stay with you. You can also seek professional support if you need more help."
+        elif support_basis == "repeated_distress":
+            count = warning_trigger["day_count"] if warning_trigger else len({_time(m["event_time"]).date() for m in rows})
+            titles[kind] = "This has been difficult on several days"
+            reasons[kind] = f"Your current, identity-confirmed words describe the same distress topic on {count} distinct days in the last seven, including today. This transparent product rule is not a clinical threshold."
+            texts[kind] = f"You have described the same kind of difficulty on {count} different days this week, including today. It may help to lighten one demand and talk with someone you trust about what has been happening. If it keeps affecting your day, consider asking a qualified professional for support."
+        refs = {r["segment_id"]: r for m in rows for r in m["source_refs"]}
+        card = {"id": _uid(), "category": "proactive", "type": kind, "title": titles[kind],
+                "summary": texts[kind], "action_text": "View sources and follow-up" if kind == "reminder" else "View the words behind this suggestion",
+                "condition_reason": reasons[kind], "date": selected, "memory_ids": list(versions),
+                "source_refs": list(refs.values()), "versions": versions,
+                "recording_count": len({m["recording_id"] for m in rows}), "status": "active",
+                "is_demo": any(m["is_demo"] for m in rows),
+                "demo_only": all(m["is_demo"] for m in rows), "provisional": True,
+                "extraction_mode": "local_rules", "generation_mode": "local_templates",
+                "created_at": stamp.isoformat()}
+        card.update(support_basis=support_basis,
+                    historical_memory_ids=[m["id"] for m in rows if _time(m["event_time"]).date() < stamp.date()],
+                    current_memory_ids=[m["id"] for m in rows if _time(m["event_time"]).date() == stamp.date()],
+                    can_schedule_bedtime=support_basis == "sleep_pattern")
+        if kind == "warning" and warning_trigger:
+            card["warning_trigger"] = warning_trigger
+        card["displayed_at"] = None
+        return card
+
+    def request_comfort(self, date: str | None = None) -> dict:
+        return self.request_support("comfort", date)
+
+    def request_support(self, kind: str, date: str | None = None) -> dict:
+        """A direct selection overrides timing, never source or preference gates."""
+        if kind not in KINDS:
+            raise ValueError("Unknown proactive support type.")
+        stamp = _now()
+        selected = _date(date or stamp.date().isoformat())
+        with self._lock, self._connect() as db:
+            self._revalidate(db, stamp)
+            candidate = self._support_candidates(db, selected, stamp)[kind]
+            rows = candidate["rows"]
+            if not rows or any(self._get(db, "segments", memory["segment_id"]).get("confirmed") is not True
+                               for memory in rows):
+                raise VersionConflict("Display now needs current, identity-confirmed matching sources and this support type enabled.")
+            versions = {memory["id"]: memory["version"] for memory in rows}
+            existing = next((card for card in self._all(db, "proactive") if card["date"] == selected
+                             and card["type"] == kind and card["status"] in {"active", "scheduled"}
+                             and card["versions"] == versions), None)
+            if existing:
+                if not self._requested_support(existing):
+                    receipt = self._automatic_receipt(existing)
+                    existing.update(status="active", delivery_mode="requested", requested_at=stamp.isoformat())
+                    if receipt:
+                        existing["automatic_receipt_at"] = receipt.isoformat()
+                    if existing.get("generation_mode") == "llm" or not self.model_mode:
+                        existing["displayed_at"] = stamp.isoformat()
+                    self._save_proactive(db, existing)
+                return existing
+            card = self._new_support_card(db, selected, kind, rows, candidate["support_basis"], stamp,
+                                          candidate.get("warning_trigger"))
+            card.update(delivery_mode="requested", requested_at=stamp.isoformat())
+            if not self.model_mode:
+                card["displayed_at"] = stamp.isoformat()
+            self._save_proactive(db, card)
+            return card
 
     def evaluate(self, date: str | None = None, now: str | datetime | None = None) -> dict:
         stamp = _time(now)
@@ -726,91 +1562,89 @@ class Engine:
             settings = self._settings(db)
             matches = self._matches(db, selected, stamp)
             matched = [kind for kind, rows in matches.items() if rows]
-            assessment = {"reason": "沒有符合的前置條件；不輸出。", "matched_types": matched,
-                          "extraction_mode": "local_rules"}
+            assessment = {"reason": "No conditions are met; nothing is shown.", "matched_types": matched,
+                          "extraction_mode": "local_rules", "types": self._type_conditions(db, selected, stamp, matches)}
+            requested = [card for card in self._all(db, "proactive") if card["date"] == selected
+                         and card["status"] == "active" and self._requested_support(card)]
+            automatic_matches = self._automatic_matches(db, matches, stamp)
+            real_warning_ready = bool(automatic_matches["warning"] and any(
+                not memory.get("is_demo") for memory in automatic_matches["warning"]))
+
+            def outcome(cards):
+                # A direct support card remains available, while a newly
+                # eligible real Warning can still enter its automatic flow.
+                combined = {card["id"]: card for card in [*requested, *cards]}
+                return {"cards": list(combined.values()), "assessment": assessment}
+
+            if requested:
+                for card in requested:
+                    if self._displayed_at(card):
+                        self._fulfill_schedule(db, card["type"], stamp)
+                if not real_warning_ready or any(card["type"] == "warning" for card in requested):
+                    assessment["reason"] = "Support was requested directly; automatic delivery settings are unchanged."
+                    assessment["types"] = self._type_conditions(db, selected, stamp, matches)
+                    return outcome([])
             blocked = self._common_block(settings, stamp)
             if blocked:
                 assessment["reason"] = blocked
-                return {"cards": [], "assessment": assessment}
-            if len(matched) > 1:
-                assessment["reason"] = "多類條件同時符合，選擇規則未定；不輸出。"
-                return {"cards": [], "assessment": assessment}
-            if not matched:
+                return outcome([])
+            automatic_types = [kind for kind, rows in automatic_matches.items() if rows]
+            if len(automatic_types) > 1:
+                assessment["reason"] = "Several types match at once and no priority rule is set; nothing is shown."
+                return outcome([])
+            if not automatic_types:
+                if matched:
+                    assessment["reason"] = "The scheduled display time has not arrived for the matching support."
+                    return outcome([])
                 memories = self._memories_for_date(db, selected)
                 if any(m["status"] == "pending" for m in memories):
-                    assessment["reason"] = "仍有片段未確認主體；這些片段不作主動提示的依據。"
-                elif any(self._eligible(m) and not m.get("reviewed") for m in memories):
-                    assessment["reason"] = "已確認原話屬於本人，理解仍待核實；請先確認每日卡片。"
+                    assessment["reason"] = "Some segments still have unconfirmed speakers; those segments are not used for proactive suggestions."
                 elif any(m.get("is_demo") and "fictional warning demonstration" in m.get("content", "").lower() for m in memories):
-                    assessment["reason"] = "虛構警示演示需要同時開啟「警示」偏好及「警示演示」。"
-                return {"cards": [], "assessment": assessment}
-            kind = matched[0]
-            rows = matches[kind]
-            support_basis = self._support_candidates(db, selected, stamp)[kind]["support_basis"]
+                    assessment["reason"] = "Fictional warning demos need both the \"Warning\" preference and \"Warning demos\" turned on."
+                elif any(self._eligible(m) and not m.get("event_time") for m in self._all(db, "memories")):
+                    assessment["reason"] = UNDATED_RECORDING_REASON
+                return outcome([])
+            kind = automatic_types[0]
+            rows = automatic_matches[kind]
+            candidate = self._support_candidates(db, selected, stamp)[kind]
+            support_basis = candidate["support_basis"]
             versions = {m["id"]: m["version"] for m in rows}
             existing = self._all(db, "proactive")
+            pending_schedule = self._schedule_pending(db, kind, stamp)
+            schedule = self._display_schedule(db, kind)
+            reusable = next((card for card in reversed(existing) if card["date"] == selected and card["type"] == kind
+                             and card["versions"] == versions and (card["status"] == "scheduled" or pending_schedule
+                             and card["status"] in {"dismissed", "snoozed"})), None)
             # Polling/evaluation is idempotent and does not create duplicate outputs.
             for card in existing:
                 if card["date"] == selected and card["type"] == kind and card["versions"] == versions:
                     if card["status"] == "active":
-                        assessment["reason"] = "前置條件符合，並已通過展示前來源及偏好檢查。"
-                        return {"cards": [card], "assessment": assessment}
-                    if card["status"] in {"dismissed", "done"} or (
-                            card["status"] == "snoozed" and settings.get("snoozed_until") and _time(settings["snoozed_until"]) > stamp):
-                        assessment["reason"] = "這項提示已略過、延後或完成；沒有新依據便不重複展示。"
-                        return {"cards": [], "assessment": assessment}
-            latest = [_time(c.get("feedback_at", c["created_at"])) for c in existing if c["status"] in {"active", "helpful", "dismissed", "snoozed", "done"}]
-            if latest and stamp < max(latest) + timedelta(minutes=settings["frequency_minutes"]):
-                assessment["reason"] = "尚未到達下一次主動關懷的頻率間隔。"
-                return {"cards": [], "assessment": assessment}
-            titles = {"reminder": "你允許的跟進事項", "suggestion": "一個可以嘗試的小步驟", "comfort": "給你一點支持", "warning": "虛構警示情境演示"}
-            reasons = {
-                "reminder": "已確認為本人事項、允許提醒、已到時間，而且未完成。",
-                "suggestion": "本人明確提出需要，原話支持一個具體可行的建議。",
-                "comfort": "本人明確表示希望獲得安慰或支持，而且已允許這類關懷。",
-                "warning": "來源明確標示為虛構警示演示，且用戶已開啟警示及演示開關。",
-            }
-            texts = {
-                "reminder": "你有一項已到時間的跟進事項，可查看原話後決定是否現在處理。",
-                "suggestion": self._suggestion(rows[0]["content"]) or "可先選一個小步驟。",
-                "comfort": "你已經說出希望得到支持。可以先停一停，給自己一點空間，再按自己的步伐處理。",
-                "warning": "這是用來驗證提示條件與回饋的虛構演示，沒有作出疾病或風險判斷。",
-            }
-            if kind == "reminder" and any(m.get("bedtime_reminder") for m in rows):
-                titles[kind] = "你設定的睡覺提醒"
-                texts[kind] = "你設定的睡覺提醒已到時間。現在可以按自己的安排準備休息。"
-            if support_basis == "sleep_pattern":
-                titles[kind] = "今晚留一點時間休息"
-                reasons[kind] = "產品示範規則：最近七天三個不同日期（含今天）的已核實原話明確表述睡眠不足；這不是疾病判斷門檻。"
-                texts[kind] = "你在最近七天的幾個不同日子，包括今天，都明確提到睡眠不足。今晚可以留一點時間休息；你想設定睡覺提醒嗎？"
-            elif support_basis == "social_follow_up":
-                titles[kind] = "這次交談值得肯定"
-                reasons[kind] = "過往已核實的原話提到孤單或社交困難；今天已核實的原話明確提到與朋友交談後感覺好些。"
-                texts[kind] = "你之前提到感到孤單或交談有困難，今天則提到與朋友聊天後感覺好些。這次交談值得肯定，可以按自己舒服的步伐繼續。"
-            elif support_basis == "emotional_follow_up":
-                titles[kind] = "陪你回看這段壓力"
-                reasons[kind] = "過往及今天已核實的原話都明確表述壓力，而且今天明確希望得到支持。"
-                texts[kind] = "你之前和今天都提到感到壓力，也說出希望得到支持。可以先停一停，選一件目前能處理的小事，或找信任的人談談。"
-            refs = {r["segment_id"]: r for m in rows for r in m["source_refs"]}
-            card = {"id": _uid(), "category": "proactive", "type": kind, "title": titles[kind],
-                    "summary": texts[kind], "action_text": "查看來源與跟進事項" if kind == "reminder" else "查看支持這項提示的原話",
-                    "condition_reason": reasons[kind], "date": selected, "memory_ids": list(versions),
-                    "source_refs": list(refs.values()), "versions": versions,
-                    "recording_count": len({m["recording_id"] for m in rows}), "status": "active",
-                    "is_demo": any(m["is_demo"] for m in rows),
-                    "demo_only": all(m["is_demo"] for m in rows), "provisional": True,
-                    "extraction_mode": "local_rules", "generation_mode": "local_templates",
-                    "created_at": stamp.isoformat()}
-            card.update(support_basis=support_basis,
-                        historical_memory_ids=[m["id"] for m in rows if _time(m["event_time"]).date() < stamp.date()],
-                        current_memory_ids=[m["id"] for m in rows if _time(m["event_time"]).date() == stamp.date()],
-                        can_schedule_bedtime=support_basis == "sleep_pattern")
+                        assessment["reason"] = "Conditions are met, and the source and preference checks passed before display."
+                        return outcome([card])
+                    if not pending_schedule and (card["status"] in {"dismissed", "done"} or (
+                            card["status"] == "snoozed" and (self._requested_support(card) or
+                            settings.get("snoozed_until") and _time(settings["snoozed_until"]) > stamp))):
+                        assessment["reason"] = "This suggestion was dismissed, snoozed or done; it is not shown again without new evidence."
+                        return outcome([])
+            latest = [receipt for card in existing if (receipt := self._automatic_receipt(card))]
+            if not pending_schedule and latest and stamp < max(latest) + timedelta(minutes=settings["frequency_minutes"]):
+                assessment["reason"] = "The minimum interval before the next proactive suggestion has not passed."
+                return outcome([])
+            card = reusable or self._new_support_card(db, selected, kind, rows, support_basis, stamp,
+                                                       candidate.get("warning_trigger"))
+            card.update(status="active", delivery_mode="scheduled" if pending_schedule else "automatic",
+                        display_schedule_revision=schedule["revision"])
+            if card.get("generation_mode") == "llm" or not self.model_mode:
+                card["displayed_at"] = stamp.isoformat()
+                card.pop("automatic_receipt_at", None)
+                self._fulfill_schedule(db, kind, stamp)
             self._save_proactive(db, card)
             # Recheck after generation, before returning it for presentation.
             self._revalidate(db, stamp)
             card = self._get(db, "proactive", card["id"])
-            assessment["reason"] = "前置條件符合，並已通過展示前來源及偏好檢查。"
-            return {"cards": [card] if card["status"] == "active" else [], "assessment": assessment}
+            assessment["reason"] = "Conditions are met, and the source and preference checks passed before display."
+            assessment["types"] = self._type_conditions(db, selected, stamp, matches)
+            return outcome([card] if card["status"] == "active" else [])
 
     def schedule_bedtime(self, card_id: str, due_at: str | datetime, expected_versions: dict[str, int]) -> dict:
         due = _time(due_at)
@@ -838,6 +1672,11 @@ class Engine:
             card = self._get(db, "proactive", card_id)
             if card["status"] != "active":
                 raise VersionConflict("這項提示已失效或已處理，請重新載入。")
+            # A ready direct display may have crossed its saved time while the
+            # browser was idle. Consume that due release before recording new
+            # feedback, so the same one-off time cannot undo the dismissal.
+            if self._displayed_at(card):
+                self._fulfill_schedule(db, card["type"], _now())
             if action == "done":
                 if card["type"] != "reminder":
                     raise ValueError("只有跟進事項可以標示完成。")
@@ -859,8 +1698,18 @@ class Engine:
             self._save_proactive(db, card)
             return card
 
+    def proactive_text_snapshot(self, card_id: str, expected_versions: dict[str, int], display_revision: int) -> dict:
+        """Recheck a queued job before network work, without holding a lock for HTTP."""
+        with self._lock, self._connect() as db:
+            self._revalidate(db, _now())
+            card = self._get(db, "proactive", card_id)
+            if (card["status"] != "active" or card["versions"] != expected_versions
+                    or card.get("display_schedule_revision", 0) != display_revision):
+                raise VersionConflict("Support sources, conditions or display time changed before generation.")
+            return {"card": card, "memories": [self._get(db, "memories", ident) for ident in card["memory_ids"]]}
+
     def apply_proactive_text(self, card_id: str, title: str, summary: str,
-                             expected_versions: dict[str, int]) -> dict:
+                             expected_versions: dict[str, int], *, expected_display_revision: int | None = None) -> dict:
         """Apply optional wording after, never instead of, deterministic gates.
 
         The caller may generate text outside the engine lock. It must present the
@@ -875,15 +1724,21 @@ class Engine:
         with self._lock, self._connect() as db:
             self._revalidate(db, _now())
             card = self._get(db, "proactive", card_id)
-            if card["status"] != "active" or card["versions"] != expected_versions:
+            if (card["status"] != "active" or card["versions"] != expected_versions
+                    or expected_display_revision is not None
+                    and card.get("display_schedule_revision", 0) != expected_display_revision):
                 raise VersionConflict("關懷條件或來源版本已改變，請重新評估。")
+            released = _now().isoformat()
             card.update(title=title, summary=summary, generation_mode="llm", provisional=True,
-                        generated_at=_now().isoformat())
+                        generated_at=released, displayed_at=released)
+            if not self._requested_support(card):
+                card.pop("automatic_receipt_at", None)
             self._save_proactive(db, card)
             self._revalidate(db, _now())
             current = self._get(db, "proactive", card_id)
             if current["status"] != "active":
                 raise VersionConflict("展示前條件已改變，關懷文案已取消。")
+            self._fulfill_schedule(db, current["type"], _now())
             return current
 
     def retrieve(self, query: str = "", date: str | None = None, person: str | None = None) -> list[dict]:
@@ -904,19 +1759,25 @@ class Engine:
             memories = [m for m in self._all(db, "memories") if m["status"] != "deleted"]
             dates = sorted({_time(m["event_time"]).date().isoformat() for m in memories if m.get("event_time")}, reverse=True)
             daily = self._memories_for_date(db, selected)
-            proactives = [c for c in self._all(db, "proactive") if c["status"] == "active" and c["date"] == selected]
+            proactives = [c for c in self._all(db, "proactive") if c["status"] == "active" and c["date"] == selected
+                          and (not self.model_mode or c.get("generation_mode") == "llm")]
             settings = self._settings(db)
             matches = self._matches(db, selected, _now())
+            type_conditions = self._type_conditions(db, selected, _now(), matches)
             matched = [kind for kind, rows in matches.items() if rows]
+            automatic_types = [kind for kind, rows in self._automatic_matches(db, matches, _now()).items() if rows]
             reason = self._common_block(settings, _now()) or (
-                "多類條件同時符合，選擇規則未定；不輸出。" if len(matched) > 1 else
-                "前置條件符合，等待或已完成評估。" if matched else "沒有符合的前置條件；不輸出。")
+                "Several types match at once and no priority rule is set; nothing is shown." if len(automatic_types) > 1 else
+                "Warning has priority for automatic display because current confirmed words meet a real distress condition."
+                if automatic_types == ["warning"] and any(not memory.get("is_demo") for memory in matches["warning"]) else
+                "Conditions are met; evaluation is pending or complete." if matched else "No conditions are met; nothing is shown.")
             if not matched and any(m["status"] == "pending" for m in daily):
-                reason = "仍有片段未確認主體；這些片段不作主動提示的依據。"
-            elif not matched and any(self._eligible(m) and not m.get("reviewed") for m in daily):
-                reason = "已確認原話屬於本人，理解仍待核實；請先確認每日卡片。"
+                reason = "Some segments still have unconfirmed speakers; those segments are not used for proactive suggestions."
             if not matched and any(m.get("is_demo") and "fictional warning demonstration" in m.get("content", "").lower() for m in daily):
-                reason = "虛構警示演示需要同時開啟「警示」偏好及「警示演示」。"
+                reason = "Fictional warning demos need both the \"Warning\" preference and \"Warning demos\" turned on."
+            elif not matched and reason == "No conditions are met; nothing is shown." and any(
+                    self._eligible(m) and not m.get("event_time") for m in memories):
+                reason = UNDATED_RECORDING_REASON
             cards = self._render_cards(db, daily, selected)
             coverage = {"active_memories": sum(self._eligible(m) for m in daily),
                         "pending_memories": sum(m["status"] == "pending" for m in daily),
@@ -924,18 +1785,22 @@ class Engine:
                         "pending_review_memories": sum(self._eligible(m) and not m.get("reviewed") for m in daily),
                         "undated_memories": sum(not m.get("event_time") for m in memories),
                         "recording_count": len({m["recording_id"] for m in daily}),
-                        "extraction_mode": "local_rules", "summary_mode": "local_rule_summary",
-                        "note": "只涵蓋已匯入並確認的片段，不代表整天或完整心理狀態。"}
+                        "extraction_mode": "deepseek" if self.model_mode else "local_rules",
+                        "summary_mode": "deepseek_automatic" if self.model_mode else "local_rule_summary",
+                        "note": "Covers only imported, confirmed segments; it does not represent the whole day or a complete psychological state."}
         return {"date": selected, "dates": dates, "recordings": self.list_recordings(),
                 "memories": sorted(memories, key=lambda m: m["created_at"], reverse=True),
                 "cards": cards, "proactive": proactives,
                 "settings": settings, "coverage": coverage,
-                "assessment": {"reason": reason, "matched_types": matched, "extraction_mode": "local_rules"}}
+                "assessment": {"reason": reason, "matched_types": matched,
+                               "types": type_conditions,
+                               "extraction_mode": "deepseek" if self.model_mode else "local_rules",
+                               "gates": "deterministic"}}
 
     def seed_demo(self) -> dict:
         # Deterministic hash makes repeated loading a no-op; no private/real audio is supplied.
         today = _now().replace(hour=10, minute=0, second=0, microsecond=0)
-        recording = self.create_recording("虛構示例：一天的片段（只有逐字稿）", None,
+        recording = self.create_recording("Fictional example: fragments of one day (transcript only)", None,
                                           f"hya-demo-baseline-{today.date()}", today.isoformat(), True)
         self.ingest_segments(recording["id"], [
             {"start": 0, "end": 6, "text": "I felt nervous before the presentation because I had not prepared the opening."},
@@ -963,8 +1828,8 @@ class Engine:
             "social_history": "I talked with my friend Alex and felt better after our conversation.",
             "emotional_history": "I feel stressed about my work. I need emotional support.",
         }
-        scenario_name = {"reminder": "提醒", "suggestion": "建議", "comfort": "安慰", "warning": "預警", "none": "零類符合", "multiple": "多類符合",
-                         "sleep": "睡眠歷史支持", "social_history": "社交歷史支持", "emotional_history": "情緒歷史支持"}[kind]
+        scenario_name = {"reminder": "Reminder", "suggestion": "Suggestion", "comfort": "Comfort", "warning": "Warning", "none": "No type matches", "multiple": "Multiple types match",
+                         "sleep": "Sleep history support", "social_history": "Social history support", "emotional_history": "Emotional history support"}[kind]
         offsets = [-2, -1, 0] if kind == "sleep" else [-1, 0] if kind in {"social_history", "emotional_history"} else [0]
         for offset in offsets:
             event_time = today + timedelta(days=offset)
@@ -973,7 +1838,7 @@ class Engine:
                 text = "I felt lonely and found it difficult to talk to people."
             elif offset < 0 and kind == "emotional_history":
                 text = "I felt stressed about my work."
-            recording = self.create_recording(f"虛構情境：{scenario_name}・{event_time.date()}（只有逐字稿）", None,
+            recording = self.create_recording(f"Fictional scenario: {scenario_name} · {event_time.date()} (transcript only)", None,
                                               f"hya-demo-scenario-{kind}-{event_time.date()}", event_time.isoformat(), True)
             self.ingest_segments(recording["id"], [{"start": 0, "end": 8, "text": text}], subject_confirmed=True)
             # Selecting a clearly fictional scenario intentionally loads its

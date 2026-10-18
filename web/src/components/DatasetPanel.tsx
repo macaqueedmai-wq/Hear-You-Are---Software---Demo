@@ -32,15 +32,16 @@ interface Dataset {
   items?: DatasetRecord[];
 }
 const kinds: Record<string, string> = {
-  knowledge: "知識",
-  counselling_case: "諮詢案例",
-  guidance: "指引",
+  knowledge: "Knowledge",
+  counselling_case: "Counselling case",
+  guidance: "Guidance",
 };
 const example = JSON.stringify({
   kind: "guidance",
-  title: "虛構格式示例：休息提醒",
-  content: "此內容只用於展示欄位格式，不是專業建議或訓練資料。",
-  source: "本產品虛構格式示例",
+  title: "Sample format example: rest reminder",
+  content:
+    "This content only demonstrates the field format. It is not professional advice or training data.",
+  source: "Sample format example from this product",
   license: "CC0-1.0",
   deidentified: true,
   consent_to_use: true,
@@ -64,7 +65,7 @@ export function DatasetPanel() {
       setDatasets(result.datasets || []);
       setError("");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "未能讀取資料集。");
+      setError(err instanceof Error ? err.message : "Could not load datasets.");
     } finally {
       setLoading(false);
     }
@@ -75,7 +76,7 @@ export function DatasetPanel() {
   async function upload() {
     if (!file) return;
     if (file.size > 5 * 1024 * 1024) {
-      setError("JSONL 超過 5 MB，請減少內容後再匯入。");
+      setError("The JSONL file exceeds 5 MB. Reduce the content, then import again.");
       return;
     }
     setBusy("upload");
@@ -88,9 +89,9 @@ export function DatasetPanel() {
       setFile(null);
       if (input.current) input.current.value = "";
       await refresh();
-      setNotice("已保存至本機，待專業審核。訓練與執行仍未啟用。");
+      setNotice("Saved locally and awaiting professional review. Training and runtime use remain disabled.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "未能匯入資料集。");
+      setError(err instanceof Error ? err.message : "Could not import the dataset.");
     } finally {
       setBusy("");
     }
@@ -101,7 +102,7 @@ export function DatasetPanel() {
     try {
       setDetail(await api<Dataset>(`/datasets/${id}`));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "未能讀取明細。");
+      setError(err instanceof Error ? err.message : "Could not load the details.");
     } finally {
       setBusy("");
     }
@@ -114,9 +115,9 @@ export function DatasetPanel() {
       if (detail?.id === id) setDetail(null);
       setDeleting(null);
       await refresh();
-      setNotice("資料集及本機檔案已刪除。");
+      setNotice("Dataset and local files deleted.");
     } catch (err) {
-      setError(err instanceof Error ? err.message : "未能刪除資料集。");
+      setError(err instanceof Error ? err.message : "Could not delete the dataset.");
     } finally {
       setBusy("");
     }
@@ -126,11 +127,11 @@ export function DatasetPanel() {
       <div className="dataset-heading">
         <h3>
           <Database size={17} />
-          專業資料集入口
+          Professional dataset intake
         </h3>
         <button
           className="icon-button"
-          aria-label="重新整理資料集"
+          aria-label="Refresh datasets"
           onClick={() => void refresh()}
           disabled={Boolean(busy)}
         >
@@ -138,12 +139,12 @@ export function DatasetPanel() {
         </button>
       </div>
       <p className="small-text muted">
-        為後期後訓練預留的本機資料入口。匯入內容均待專業審核，不會自動傳送給模型、訓練或用於預警。
+        A local intake reserved for later post-training. Imported content awaits professional review and is never sent to a model, used for training, or used for proactive care automatically.
       </p>
       <div className="dataset-badges">
-        <span className="tag">待專業審核</span>
-        <span className="tag">未訓練</span>
-        <span className="tag">未啟用</span>
+        <span className="tag">Awaiting professional review</span>
+        <span className="tag">Not trained</span>
+        <span className="tag">Disabled</span>
       </div>
       {error && (
         <div className="alert alert-error" role="alert">
@@ -157,7 +158,7 @@ export function DatasetPanel() {
         </div>
       )}
       <label className="dataset-file-label">
-        選擇本機 JSONL 檔案
+        Choose a local JSONL file
         <input
           ref={input}
           type="file"
@@ -166,7 +167,7 @@ export function DatasetPanel() {
         />
       </label>
       <div className="dataset-upload-actions">
-        <small>最多 5 MB／1000 筆 · 必須去識別並獲授權</small>
+        <small>Up to 5 MB / 1000 items · Must be de-identified and licensed</small>
         <button
           className="small-button"
           disabled={!file || Boolean(busy)}
@@ -177,7 +178,7 @@ export function DatasetPanel() {
           ) : (
             <UploadCloud size={15} />
           )}
-          匯入並等待審核
+          Import for review
         </button>
       </div>
       <button
@@ -185,28 +186,27 @@ export function DatasetPanel() {
         onClick={() => setShowExample((previous) => !previous)}
       >
         <FileText size={14} />
-        {showExample ? "收起格式說明" : "查看 JSONL 格式與虛構示例"}
+        {showExample ? "Hide format guide" : "View the JSONL format and a sample"}
       </button>
       {showExample && (
         <div className="dataset-example">
           <p>
-            每行一個 JSON 物件，必填
-            kind、title、content、source、license、deidentified:true、consent_to_use:true。kind
-            可為 knowledge、counselling_case、guidance；professional_reviewer
-            選填。
+            One JSON object per line. Required fields: kind, title, content, source, license,
+            deidentified:true and consent_to_use:true. kind can be knowledge,
+            counselling_case or guidance; professional_reviewer is optional.
           </p>
-          <strong>以下僅為虛構格式示例，不是專業資料：</strong>
+          <strong>This is only a sample format example, not professional data:</strong>
           <pre>{example}</pre>
         </div>
       )}
       {loading ? (
         <div className="dataset-loading" role="status">
           <LoaderCircle size={16} className="spin" />
-          正在讀取本機資料集…
+          Loading local datasets…
         </div>
       ) : datasets.length === 0 ? (
         <p className="dataset-empty">
-          尚未匯入資料集。只有通過欄位及授權檢查的檔案才會保存。
+          No datasets imported yet. Only files that pass the field and licence checks are kept.
         </p>
       ) : (
         <div className="dataset-list">
@@ -215,7 +215,7 @@ export function DatasetPanel() {
               <div>
                 <strong>{dataset.filename}</strong>
                 <small>
-                  {dataset.item_count} 筆 · 待專業審核 · 未訓練 · 未啟用
+                  {dataset.item_count} items · Awaiting professional review · Not trained · Disabled
                 </small>
               </div>
               <button
@@ -223,11 +223,11 @@ export function DatasetPanel() {
                 disabled={Boolean(busy)}
                 onClick={() => void open(dataset.id)}
               >
-                明細
+                Details
               </button>
               <button
                 className="icon-button"
-                aria-label={`刪除資料集 ${dataset.filename}`}
+                aria-label={`Delete dataset ${dataset.filename}`}
                 disabled={Boolean(busy)}
                 onClick={() => setDeleting(dataset.id)}
               >
@@ -235,20 +235,20 @@ export function DatasetPanel() {
               </button>
               {deleting === dataset.id && (
                 <div className="dataset-delete-confirm">
-                  <p>確定永久刪除這個本機資料集及檔案？刪除後無法復原。</p>
+                  <p>Permanently delete this local dataset and its files? This cannot be undone.</p>
                   <div>
                     <button
                       className="small-button ghost"
                       onClick={() => setDeleting(null)}
                     >
-                      取消
+                      Cancel
                     </button>
                     <button
                       className="small-button"
                       disabled={Boolean(busy)}
                       onClick={() => void remove(dataset.id)}
                     >
-                      確認刪除
+                      Delete permanently
                     </button>
                   </div>
                 </div>
@@ -263,41 +263,41 @@ export function DatasetPanel() {
             <h4>{detail.filename}</h4>
             <button
               className="icon-button"
-              aria-label="關閉資料集明細"
+              aria-label="Close dataset details"
               onClick={() => setDetail(null)}
             >
               <X size={16} />
             </button>
           </div>
           <p className="small-text muted">
-            待專業審核 · 未訓練 · 未啟用。提供審核人名稱不代表已完成專業審核。
+            Awaiting professional review · Not trained · Disabled. Naming a reviewer does not mean professional review is complete.
           </p>
           {detail.items?.map((record, index) => (
             <article key={index}>
-              <span className="tag">{kinds[record.kind] || "資料"}</span>
+              <span className="tag">{kinds[record.kind] || "Data"}</span>
               <h4>{record.title}</h4>
               <p>{record.content}</p>
               <dl>
                 <div>
-                  <dt>來源</dt>
+                  <dt>Source</dt>
                   <dd>{record.source}</dd>
                 </div>
                 <div>
-                  <dt>授權</dt>
+                  <dt>Licence</dt>
                   <dd>{record.license}</dd>
                 </div>
                 <div>
-                  <dt>去識別／獲准使用</dt>
+                  <dt>De-identified / consent to use</dt>
                   <dd>
                     {record.deidentified && record.consent_to_use
-                      ? "均已聲明"
-                      : "資料不完整"}
+                      ? "Both declared"
+                      : "Incomplete data"}
                   </dd>
                 </div>
                 {record.professional_reviewer && (
                   <div>
-                    <dt>所填審核人</dt>
-                    <dd>{record.professional_reviewer}（未核實）</dd>
+                    <dt>Declared reviewer</dt>
+                    <dd>{record.professional_reviewer} (unverified)</dd>
                   </div>
                 )}
               </dl>

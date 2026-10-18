@@ -26,6 +26,16 @@ def test_audio_validation_decodes_without_whisper_loading(tmp_path, monkeypatch)
     assert result["channels"] == 1
 
 
+def test_whisper_audio_decoder_matches_installed_pyav(tmp_path):
+    # Exercise the real decoder without downloading/loading model weights.
+    # PyAV 19 removed an argument still passed by faster-whisper 1.2.1.
+    from faster_whisper.audio import decode_audio
+
+    decoded = decode_audio(str(make_wave(tmp_path / "audio.wav", 2.5)))
+    assert decoded.dtype.name == "float32"
+    assert decoded.shape == (40000,)
+
+
 def test_corrupt_or_missing_audio_rejected_before_model(tmp_path):
     invalid = tmp_path / "not-real.mp3"
     invalid.write_text("This is not an audio stream.")

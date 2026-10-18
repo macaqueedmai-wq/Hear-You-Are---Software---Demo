@@ -69,7 +69,14 @@ def upload(client, *, recorded_at=True, filename="english.wav", data=None):
         payload["recorded_at"] = recorded_at if isinstance(recorded_at, str) else datetime.now(timezone(timedelta(hours=8))).isoformat()
     response = client.post("/api/recordings", files={"file": (filename, data if data is not None else tiny_wav(), "audio/wav")}, data=payload)
     assert response.status_code == 200, response.text
-    return response.json()
+    result = response.json()
+    # Historical/undated regression fixtures model old internal records. Public
+    # clients cannot change the automatically assigned upload chronology.
+    if recorded_at is False or isinstance(recorded_at, str):
+        result["recording"] = client.app.state.engine.update_recording_time(
+            result["recording"]["id"], recorded_at if isinstance(recorded_at, str) else None,
+            result["recording"]["recorded_at"])
+    return result
 
 
 def completed(client, recording_id):
@@ -141,6 +148,54 @@ def test_upload_deduplicates_by_audio_hash_without_extra_evidence(api):
     assert len(fake.calls) == 1
 
 
+@pytest.mark.parametrize("actionable", [True, False])
+def test_transcription_failure_keeps_safe_guidance_and_retry_recovers(api, monkeypatch, caplog, actionable):
+    from hya.asr import TranscriptionError
+
+    client, app, fake, directory = api
+    transcribe = fake.transcribe
+    attempts = []
+    guidance = "音訊解碼套件版本不相容，請重新安裝後端依賴後重試。"
+    internal_detail = "internal dependency diagnostic"
+
+    def fail_once(path, language="en"):
+        attempts.append(path)
+        if len(attempts) == 1:
+            if actionable:
+                raise TranscriptionError(guidance) from TypeError(internal_detail)
+            raise RuntimeError(internal_detail)
+        return transcribe(path, language)
+
+    monkeypatch.setattr(fake, "transcribe", fail_once)
+    response = upload(client)
+    recording_id = response["recording"]["id"]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        recording = client.get(f"/api/recordings/{recording_id}").json()
+        if recording["status"] == "failed":
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("Background ASR did not report its failure within five seconds")
+
+    expected = guidance if actionable else "轉錄未完成（RuntimeError）；請檢查模型、裝置及錄音格式，然後重試。"
+    assert recording["error"] == expected
+    assert internal_detail not in recording["error"]
+    assert any(record.name == "hya" and record.exc_info for record in caplog.records)
+    assert internal_detail in caplog.text  # Cause details remain available locally.
+    assert client.get(f"/api/recordings/{recording_id}/audio").content == tiny_wav()
+    assert client.get("/api/state").json()["memories"] == []
+
+    retried = client.post(f"/api/recordings/{recording_id}/retry")
+    assert retried.status_code == 200, retried.text
+    recovered = completed(client, recording_id)
+    assert recovered["error"] is None
+    assert len(attempts) == 2
+    assert len(fake.calls) == 1
+    assert len(client.get("/api/recordings").json()) == 1
+    assert len(client.get("/api/state").json()["memories"]) == 2
+
+
 def test_pending_identity_partial_confirmation_and_source_audio_range(api):
     client, app, fake, directory = api
     raw = tiny_wav()
@@ -157,7 +212,7 @@ def test_pending_identity_partial_confirmation_and_source_audio_range(api):
     assert sum(m["subject_id"] == "user" for m in after["memories"]) == 1
     assert sum(m["status"] == "pending" for m in after["memories"]) == 1
     assert len(after["cards"]) == 1 and after["cards"][0]["category"] == "mood"
-    assert after["proactive"] == []  # Identity alone does not approve AI understanding.
+    assert after["proactive"][0]["type"] == "comfort"
     assert after["cards"][0]["review_status"] == "pending"
     after = review_cards(client, after)
     assert after["proactive"][0]["type"] == "comfort"
@@ -291,7 +346,7 @@ def test_external_llm_is_blocked_without_explicit_permission(api, monkeypatch):
         monkeypatch.setattr(importlib.import_module("hya.llm").httpx, "Client", forbidden_client)
         status = protected.get("/api/analysis/status").json()
         assert status["external"] is True and status["configured"] is False
-        assert "允許" in status["reason"]
+        assert "explicitly allowed" in status["reason"]
         response = protected.post("/api/analysis/generate", json={})
         assert response.status_code == 422, response.text
         assert protected.get("/api/state").json()["cards"]
@@ -318,8 +373,9 @@ def test_llm_receives_only_selected_day_confirmed_card_sources(api):
 
         def summarize(self, memories):
             self.captured = list(memories)
-            first = next(m for m in memories if m["category"] == "mood")
-            return [{"category": "mood", "title": "你曾表達需要支持", "summary": "這一天你曾表達希望獲得安慰。", "memory_ids": [first["id"]]}]
+            return [{"category": category, "title": "你曾表達需要支持", "summary": "這一天你曾表達希望獲得安慰。",
+                     "memory_ids": [memory["id"] for memory in memories if memory["category"] == category]}
+                    for category in sorted({memory["category"] for memory in memories})]
 
     analyzer = CapturingAnalyzer()
     isolated_app = importlib.import_module("hya.app").create_app(directory / "selected-day", transcriber=FakeTranscriber(), analyzer=analyzer)

@@ -3,4 +3,5 @@ uvicorn>=0.30,<1
 python-multipart>=0.0.20,<1
 python-dotenv>=1,<2
 httpx>=0.28,<1
-faster-whisper>=1.2,<2
+# PyAV validates/decodes audio; CPU SenseVoice adds requirements-sensevoice.txt.
+av>=11,<19

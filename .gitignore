@@ -1,4 +1,5 @@
 .venv/
+.venv-asr/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -14,6 +15,7 @@ dist/
 *.log
 *.db
 *.sqlite*
-artifacts/private/
+artifacts/
+*.tsbuildinfo
 .DS_Store
 Thumbs.db
